@@ -1735,7 +1735,8 @@ impl App {
             }
             let slot = ((x - editor_left).max(0) / self.scale(TAB_WIDTH).max(1)) as usize;
             let index = self.tab_first + slot;
-            if index < self.tabs.len() {
+            // Only the tabs that fit are drawn; the space past them isn't a tab.
+            if slot < self.visible_tab_count(hwnd) && index < self.tabs.len() {
                 if (x - editor_left) % self.scale(TAB_WIDTH) >= self.scale(TAB_WIDTH - 30) {
                     self.close_tab(hwnd, index);
                 } else {

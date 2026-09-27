@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+#### Fixed
+- **AI Assistant Panel Toggle** ([#28](https://github.com/mehmoodulhaq570/LightLine/issues/28)): The rail button and Welcome action now open and close the Assistant panel, and the editor resizes to fit. Opening it keeps Find/Replace open, clicks, hovers and scrolling over the panel no longer reach the editor behind it, and in a narrow window the panel shrinks to fit instead of running off the edge.
+
 ## [v0.2.0] - 2026-09-26
 
 ### 2026-09-26
