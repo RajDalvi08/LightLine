@@ -1,6 +1,10 @@
 use super::*;
 
 static EDITOR_WINDOW: AtomicIsize = AtomicIsize::new(0);
+// Whether the last WM_SYSKEYDOWN was consumed by LightLine (see WM_SYSCHAR).
+static SYSKEY_HANDLED: AtomicBool = AtomicBool::new(false);
+// The WM_CHAR code (13 or 9) of an Enter/Tab the key handler consumed.
+static CONSUMED_CHAR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 unsafe extern "system" fn console_control(event: u32) -> i32 {
     if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
@@ -191,6 +195,17 @@ unsafe extern "system" fn wnd_proc(
             app.poll_watcher(hwnd);
             0
         }
+        WM_TIMER if wparam == GUTTER_DIFF_TIMER => {
+            app.start_gutter_diff();
+            0
+        }
+        WM_TIMER if wparam == STATUS_TIMER => {
+            unsafe {
+                KillTimer(hwnd, STATUS_TIMER);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
         LSP_EVENT_MESSAGE => {
             app.poll_lsp(hwnd);
             0
@@ -260,15 +275,58 @@ unsafe extern "system" fn wnd_proc(
             1
         }
         WM_KEYDOWN => {
-            if app.key(hwnd, wparam as u32) {
+            let key = wparam as u32;
+            if app.key(hwnd, key) {
+                // The editor inserts newlines and tabs from WM_CHAR. When a
+                // handler consumed Enter or Tab instead (running a palette
+                // command, accepting a completion, confirming an Explorer
+                // rename), the WM_CHAR TranslateMessage generates for it must
+                // not reach the editor as an extra newline or tab.
+                let consumed = if key == VK_RETURN as u32 {
+                    13
+                } else if key == VK_TAB as u32 {
+                    9
+                } else {
+                    0
+                };
+                CONSUMED_CHAR.store(consumed, Ordering::Relaxed);
+                0
+            } else {
+                CONSUMED_CHAR.store(0, Ordering::Relaxed);
+                drop(app);
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        // Alt chords and F10 arrive as WM_SYSKEYDOWN instead of WM_KEYDOWN,
+        // so without this Shift+Alt+F (Format Document), F10 (Step Over) and
+        // Alt keys in the terminal never reached the key handler. Everything
+        // else -- Alt+F4, Alt+Space -- keeps Windows' default behavior.
+        WM_SYSKEYDOWN => {
+            let key = wparam as u32;
+            let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+            let routed = key == VK_F10 as u32
+                || (shift && key == 0x46)
+                || (app.terminal_focus
+                    && key != VK_F4 as u32
+                    && key != VK_SPACE as u32
+                    && key != VK_MENU as u32);
+            let handled = routed && app.key(hwnd, key);
+            SYSKEY_HANDLED.store(handled, Ordering::Relaxed);
+            if handled {
                 0
             } else {
                 drop(app);
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
+        // The WM_SYSCHAR that follows a handled Alt chord would otherwise
+        // make Windows play its "no such menu" error sound.
+        WM_SYSCHAR if SYSKEY_HANDLED.swap(false, Ordering::Relaxed) => 0,
         WM_CHAR => {
-            app.character(hwnd, wparam as u16);
+            let consumed = CONSUMED_CHAR.swap(0, Ordering::Relaxed);
+            if consumed == 0 || consumed != wparam as u32 {
+                app.character(hwnd, wparam as u16);
+            }
             0
         }
         WM_LBUTTONDOWN => {
@@ -328,6 +386,10 @@ unsafe extern "system" fn wnd_proc(
                 GetCursorPos(&mut point);
                 ScreenToClient(hwnd, &mut point);
             }
+            if app.quick_open {
+                app.scroll_quick_open(hwnd, delta as i32);
+                return 0;
+            }
             let mut rect = RECT::default();
             unsafe { GetClientRect(hwnd, &mut rect) };
             if app.terminal_visible
@@ -350,14 +412,14 @@ unsafe extern "system" fn wnd_proc(
                             app.search_results.len(),
                             ((rect.bottom - app.scale(STATUS + WORKBENCH_HEADER + 113))
                                 / app.scale(48).max(1))
-                                .max(1) as usize,
+                            .max(1) as usize,
                         ),
                         SideView::Review => (app.git_rows().len(), app.git_visible_rows(hwnd)),
                         _ => (
                             app.changes.len(),
                             ((rect.bottom - app.scale(STATUS + WORKBENCH_HEADER + 113))
                                 / app.scale(EXPLORER_ROW).max(1))
-                                .max(1) as usize,
+                            .max(1) as usize,
                         ),
                     };
                     let max = count.saturating_sub(visible);
@@ -404,11 +466,11 @@ unsafe extern "system" fn wnd_proc(
                 let pane = usize::from(point.x >= app.pane_divider(hwnd));
                 app.focus_pane(hwnd, pane);
             }
-            if delta > 0 {
-                app.view_mut().first_line = app.view().first_line.saturating_sub(3);
-            } else if delta < 0 {
+            // Scroll by visible lines, so a folded block counts as one row.
+            if delta != 0 {
+                let rows = if delta > 0 { -3 } else { 3 };
                 app.view_mut().first_line =
-                    (app.view().first_line + 3).min(app.doc().line_count().saturating_sub(1));
+                    app.doc().step_visible_lines(app.view().first_line, rows);
             }
             app.update_scrollbar(hwnd);
             unsafe {
@@ -420,13 +482,16 @@ unsafe extern "system" fn wnd_proc(
             let code = (wparam & 0xffff) as i32;
             let max = app.doc().line_count().saturating_sub(1);
             app.view_mut().first_line = match code {
-                SB_LINEUP => app.view().first_line.saturating_sub(1),
-                SB_LINEDOWN => (app.view().first_line + 1).min(max),
-                SB_PAGEUP => app
-                    .view()
-                    .first_line
-                    .saturating_sub(app.visible_lines(hwnd)),
-                SB_PAGEDOWN => (app.view().first_line + app.visible_lines(hwnd)).min(max),
+                SB_LINEUP => app.doc().step_visible_lines(app.view().first_line, -1),
+                SB_LINEDOWN => app.doc().step_visible_lines(app.view().first_line, 1),
+                SB_PAGEUP => {
+                    let page = app.visible_lines(hwnd) as isize;
+                    app.doc().step_visible_lines(app.view().first_line, -page)
+                }
+                SB_PAGEDOWN => {
+                    let page = app.visible_lines(hwnd) as isize;
+                    app.doc().step_visible_lines(app.view().first_line, page)
+                }
                 SB_THUMBPOSITION | SB_THUMBTRACK => {
                     let mut info = SCROLLINFO {
                         cbSize: size_of::<SCROLLINFO>() as u32,
@@ -436,7 +501,10 @@ unsafe extern "system" fn wnd_proc(
                     unsafe {
                         GetScrollInfo(hwnd, SB_VERT, &mut info);
                     }
-                    (info.nTrackPos.max(0) as usize).min(max)
+                    // The track position is a screen row (see update_scrollbar).
+                    app.doc()
+                        .line_at_visual_index(info.nTrackPos.max(0) as usize)
+                        .min(max)
                 }
                 _ => app.view().first_line,
             };
@@ -514,7 +582,11 @@ pub fn run() -> io::Result<()> {
             &dark_titlebar as *const i32 as *const std::ffi::c_void,
             size_of::<i32>() as u32,
         );
-        let mut app = Box::new(RefCell::new(App::new(hwnd, app_icons.large, app_icons.hero)));
+        let mut app = Box::new(RefCell::new(App::new(
+            hwnd,
+            app_icons.large,
+            app_icons.hero,
+        )));
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
@@ -534,6 +606,11 @@ pub fn run() -> io::Result<()> {
         // The approved workbench keeps a compact terminal dock available by
         // default; it remains collapsible with Ctrl+` or the header close.
         app.borrow_mut().open_terminal(hwnd);
+        // Reported only now: opening the startup file or session sets its own
+        // status, which would otherwise replace this straight away.
+        if let Err(error) = lightline::settings::Settings::try_load() {
+            app.borrow_mut().status = error;
+        }
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);

@@ -12,6 +12,7 @@ impl App {
         self.terminal_focus = false;
         self.quick_query.clear();
         self.quick_selected = 0;
+        self.quick_first = 0;
         self.quick_loading = false;
         if let Some(root) = self.workspace_root.clone() {
             self.quick_files.clear();
@@ -51,7 +52,15 @@ impl App {
                 },
                 7,
             ),
-            ("New Terminal", 9),
+            ("New Terminal (Default)", 9),
+            ("New Terminal: PowerShell", 25),
+            ("New Terminal: Command Prompt", 26),
+            ("New Terminal: Git Bash", 27),
+            ("New Terminal: WSL", 28),
+            ("Terminal: Set Default to PowerShell", 29),
+            ("Terminal: Set Default to Command Prompt", 30),
+            ("Terminal: Set Default to Git Bash", 31),
+            ("Terminal: Set Default to WSL", 32),
             ("Kill Active Terminal", 15),
             ("Restart Terminal", 10),
             ("Restart Terminal (No Profile)", 11),
@@ -67,19 +76,47 @@ impl App {
             ("New File in Workspace", 22),
             ("New Folder in Workspace", 23),
             ("Refresh Explorer", 24),
+            ("Debug: Start Debugging", 33),
+            ("Debug: Select Configuration", 34),
+            ("Python: Install debugpy (for debugging)", 35),
         ]
         .into_iter()
         .filter(|(name, _)| name.to_ascii_lowercase().contains(&query))
         .collect()
     }
 
-    // Matches the 7-row render cap in paint_quick_open, so keyboard navigation
-    // never selects a row that isn't actually visible.
     pub(super) fn quick_count(&self) -> usize {
         if self.quick_query.starts_with('>') {
-            self.quick_commands().len().min(7)
+            self.quick_commands().len()
         } else {
-            self.quick_matches().len().min(7)
+            self.quick_matches().len()
+        }
+    }
+
+    // Selects a Quick Open row, scrolling the list just enough to show it.
+    pub(super) fn quick_select(&mut self, index: usize) {
+        self.quick_selected = index.min(self.quick_count().saturating_sub(1));
+        if self.quick_selected < self.quick_first {
+            self.quick_first = self.quick_selected;
+        } else if self.quick_selected >= self.quick_first + QUICK_ROWS {
+            self.quick_first = self.quick_selected + 1 - QUICK_ROWS;
+        }
+    }
+
+    // Mouse wheel over Quick Open scrolls its list, not the editor behind it.
+    pub(super) fn scroll_quick_open(&mut self, hwnd: HWND, delta: i32) {
+        let max_first = self.quick_count().saturating_sub(QUICK_ROWS);
+        let first = if delta > 0 {
+            self.quick_first.saturating_sub(3)
+        } else {
+            (self.quick_first + 3).min(max_first)
+        };
+        if first != self.quick_first {
+            self.quick_first = first;
+            // Keep the selection on screen so Enter never runs a hidden row.
+            let last = first + QUICK_ROWS - 1;
+            self.quick_selected = self.quick_selected.clamp(first, last);
+            unsafe { InvalidateRect(hwnd, null(), 0) };
         }
     }
 
@@ -146,6 +183,24 @@ impl App {
                     }
                     self.refresh(hwnd);
                 }
+                Some(25) => self.new_terminal_with_shell(hwnd, ShellKind::PowerShell, false),
+                Some(26) => self.new_terminal_with_shell(hwnd, ShellKind::CommandPrompt, false),
+                Some(27) => self.new_terminal_with_shell(hwnd, ShellKind::GitBash, false),
+                Some(28) => self.new_terminal_with_shell(hwnd, ShellKind::Wsl, false),
+                Some(29) => self.set_default_terminal_profile(hwnd, ShellKind::PowerShell),
+                Some(30) => self.set_default_terminal_profile(hwnd, ShellKind::CommandPrompt),
+                Some(31) => self.set_default_terminal_profile(hwnd, ShellKind::GitBash),
+                Some(32) => self.set_default_terminal_profile(hwnd, ShellKind::Wsl),
+                Some(33) => self.start_debug_session(hwnd),
+                Some(34) => {
+                    // Open the panel and drop the menu down from its selector.
+                    if !(self.side_view == SideView::Debug && self.explorer_visible) {
+                        self.toggle_side_view(hwnd, SideView::Debug);
+                    }
+                    let config = self.debug_config_rect(self.scale(RAIL), self.editor_left());
+                    self.show_debug_config_menu(hwnd, config.left, config.bottom);
+                }
+                Some(35) => self.install_debugpy(hwnd),
                 _ => {}
             }
         } else {
@@ -164,8 +219,29 @@ impl App {
             if !path.exists() {
                 let _ = lightline::settings::Settings::default().save();
             }
-            self.settings = lightline::settings::Settings::load();
+            self.reload_settings();
             self.open(hwnd, Some(path));
+        }
+    }
+
+    // Re-reads settings.json and applies it, so an edit takes effect as soon
+    // as the file is saved rather than on the next launch. A file that can't
+    // be used keeps the current settings and says why in the status bar.
+    pub(super) fn reload_settings(&mut self) -> bool {
+        match lightline::settings::Settings::try_load() {
+            Ok(settings) => {
+                self.settings = settings;
+                // An installed color theme already folded the old overrides
+                // in; it keeps them until it is reinstalled or removed.
+                if self.active_color_theme.is_none() {
+                    self.theme = Theme::default_dark().with_overrides(&self.settings.colors);
+                }
+                true
+            }
+            Err(error) => {
+                self.status = error;
+                false
+            }
         }
     }
 
@@ -199,7 +275,7 @@ impl App {
                     .to_ascii_lowercase()
                     .contains(&query)
             })
-            .take(8)
+            .take(50)
             .cloned()
             .collect()
     }
@@ -332,22 +408,11 @@ impl App {
             return;
         };
         let root = workflow::python_project_root(&file, self.workspace_root.as_deref());
-        let interpreter = match self.python_interpreter.clone() {
-            Some(interpreter) => interpreter,
-            None => match workflow::detect_python_interpreter(Some(&root)) {
-                Some(detected) => {
-                    self.python_interpreter = Some(detected.clone());
-                    self.status =
-                        format!("Using Python interpreter {}", detected.to_string_lossy());
-                    detected
-                }
-                None => {
-                    self.status =
-                        "Select a Python interpreter or virtual environment before running".into();
-                    unsafe { InvalidateRect(hwnd, null(), 0) };
-                    return;
-                }
-            },
+        let Some(interpreter) = self.resolve_python_interpreter(&root) else {
+            self.status =
+                "Select a Python interpreter or virtual environment before running".into();
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+            return;
         };
         // PowerShell only executes a quoted-string command when it's prefixed
         // with the call operator; without it "'...exe' -u '...'" parses as a
@@ -358,6 +423,41 @@ impl App {
             "& {} -u {}",
             terminal::powershell_quoted(&interpreter),
             terminal::powershell_quoted(Path::new(&display_path(&file)))
+        );
+        self.run_in_terminal(hwnd, &command);
+    }
+
+    // The interpreter Run Python File and Python debugging use: the one the
+    // user selected, else a .venv near `root` or python on PATH, remembered
+    // once found.
+    pub(super) fn resolve_python_interpreter(&mut self, root: &Path) -> Option<PathBuf> {
+        if let Some(interpreter) = self.python_interpreter.clone() {
+            return Some(interpreter);
+        }
+        let detected = workflow::detect_python_interpreter(Some(root))?;
+        self.python_interpreter = Some(detected.clone());
+        self.status = format!("Using Python interpreter {}", detected.to_string_lossy());
+        Some(detected)
+    }
+
+    // Installs debugpy into the interpreter Python debugging uses, in the
+    // Output tab so pip's progress and any error stay visible.
+    pub(super) fn install_debugpy(&mut self, hwnd: HWND) {
+        let root = match self.doc().path.clone() {
+            Some(file) => workflow::python_project_root(&file, self.workspace_root.as_deref()),
+            None => self
+                .workspace_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".")),
+        };
+        let Some(interpreter) = self.resolve_python_interpreter(&root) else {
+            self.status = "Select a Python interpreter before installing debugpy".into();
+            unsafe { InvalidateRect(hwnd, null(), 0) };
+            return;
+        };
+        let command = format!(
+            "& {} -m pip install debugpy",
+            terminal::powershell_quoted(Path::new(&display_path(&interpreter)))
         );
         self.run_in_terminal(hwnd, &command);
     }
@@ -409,7 +509,11 @@ impl App {
     }
 
     pub(super) fn show_diff(&mut self, hwnd: HWND, path: PathBuf, staged: bool) {
-        let Some(root) = self.git_root.clone().or_else(|| self.workspace_root.clone()) else {
+        let Some(root) = self
+            .git_root
+            .clone()
+            .or_else(|| self.workspace_root.clone())
+        else {
             return;
         };
         self.review_staged = staged;
@@ -463,8 +567,11 @@ impl App {
                 WorkerMessage::GitWrite(action, result) => {
                     self.git_write_finished(hwnd, &action, result);
                 }
-                WorkerMessage::GutterDiff(_root, path, result) => {
-                    self.gutter_diff_finished(&path, result);
+                WorkerMessage::GutterDiff(path, _relative, head_text, result) => {
+                    self.gutter_diff_finished(&path, head_text, result);
+                }
+                WorkerMessage::GutterComputed(generation, path, diff) => {
+                    self.gutter_diff_computed(generation, path, diff);
                 }
                 WorkerMessage::Diff(root, path, result)
                     if self.git_root.as_ref() == Some(&root)
@@ -498,7 +605,10 @@ impl App {
                         Ok(entries) => {
                             self.zed_registry_loaded = true;
                             for (id, version) in entries {
-                                if self.extensions.iter().any(|ext| ext.id == id) {
+                                if let Some(ext) =
+                                    self.extensions.iter_mut().find(|ext| ext.id == id)
+                                {
+                                    ext.version = version;
                                     continue;
                                 }
                                 self.extensions.push(Extension {
@@ -506,18 +616,18 @@ impl App {
                                     name: id,
                                     publisher: "zed-industries/extensions".into(),
                                     version,
-                                    description: "Zed extension — install to see whether LightLine \
-                                                   supports it yet (icon themes only, for now)"
-                                        .into(),
-                                    downloads: String::new(),
-                                    rating: String::new(),
+                                    description:
+                                        "Zed extension — install to see whether LightLine \
+                                                   supports it yet (icon and color themes)"
+                                            .into(),
                                     installed: false,
                                     installing: false,
                                 });
                             }
                         }
                         Err(error) => {
-                            self.status = format!("Could not reach the Zed extension registry: {error}");
+                            self.status =
+                                format!("Could not reach the Zed extension registry: {error}");
                         }
                     }
                 }
@@ -557,14 +667,20 @@ impl App {
                     self.debug_build_finished(hwnd, result);
                 }
                 WorkerMessage::CDiagnostics(file, diagnostics) => {
-                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.document.path.as_deref() == Some(file.as_path())) {
+                    if let Some(tab) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.document.path.as_deref() == Some(file.as_path()))
+                    {
                         let count = diagnostics.len();
                         tab.diagnostics = diagnostics;
                         if count > 0 {
                             self.status = format!(
                                 "{count} issue{} found while checking {}",
                                 if count == 1 { "" } else { "s" },
-                                file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                                file.file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default(),
                             );
                         }
                     }
@@ -583,8 +699,10 @@ impl App {
                     }
                     match result {
                         Ok(formatted) => {
-                            let formatted_clean = formatted.replace("\r\n", "\n").replace('\r', "\n");
-                            let current_clean = self.doc().text().replace("\r\n", "\n").replace('\r', "\n");
+                            let formatted_clean =
+                                formatted.replace("\r\n", "\n").replace('\r', "\n");
+                            let current_clean =
+                                self.doc().text().replace("\r\n", "\n").replace('\r', "\n");
                             if formatted_clean == current_clean {
                                 self.status = format!("Already formatted with {formatter_name}");
                             } else {

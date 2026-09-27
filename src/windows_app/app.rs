@@ -28,6 +28,7 @@ pub(super) struct TerminalPane {
     pub(super) id: SessionId,
     pub(super) snapshot: Option<Arc<Snapshot>>,
     pub(super) applied_size: Option<TerminalSize>,
+    pub(super) shell_kind: ShellKind,
 }
 
 // What a generic Zed-registry install turned out to be, resolved on the
@@ -44,7 +45,14 @@ pub(super) enum WorkerMessage {
     // because refreshes fire on activation, save and every completed action.
     Repo(u64, Result<RepoState, String>),
     Diff(PathBuf, PathBuf, Result<Vec<DiffRow>, String>),
-    GutterDiff(PathBuf, PathBuf, Result<Vec<DiffRow>, String>),
+    GutterDiff(
+        PathBuf,
+        PathBuf,
+        Option<String>,
+        Result<Vec<DiffRow>, String>,
+    ),
+    // A live gutter recompute: (request generation, file, marks).
+    GutterComputed(u64, PathBuf, GutterDiff),
     GitWrite(GitAction, Result<(), String>),
     ExtensionInstalled(String, bool),
     // The full Zed registry id/version list, for the Extensions panel search.
@@ -120,6 +128,44 @@ pub(super) enum ExtensionsTab {
     Installed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ExtensionsFilter {
+    Featured,
+    Themes,
+    Formatters,
+}
+
+impl ExtensionsFilter {
+    // The Marketplace filter pills: label and unscaled width, shared by the
+    // painter and the click handler so the two can't drift apart.
+    pub(super) const PILLS: [(ExtensionsFilter, &'static str, i32); 3] = [
+        (ExtensionsFilter::Featured, "Featured", 69),
+        (ExtensionsFilter::Themes, "Themes", 60),
+        (ExtensionsFilter::Formatters, "Formatters", 82),
+    ];
+}
+
+// What LightLine knows an extension to be. Only the curated entries are
+// known up front; a registry entry's kind is found out when it's installed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ExtensionCategory {
+    Formatter,
+    IconTheme,
+    ColorTheme,
+    Unknown,
+}
+
+impl ExtensionCategory {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ExtensionCategory::Formatter => "Formatter",
+            ExtensionCategory::IconTheme => "Icon theme",
+            ExtensionCategory::ColorTheme => "Color theme",
+            ExtensionCategory::Unknown => "Zed extension",
+        }
+    }
+}
+
 // Owned strings (not &'static str) because entries can now come from the
 // live Zed registry at runtime, not just the two extensions LightLine ships
 // knowledge of.
@@ -130,11 +176,19 @@ pub(super) struct Extension {
     pub(super) publisher: String,
     pub(super) version: String,
     pub(super) description: String,
-    pub(super) downloads: String,
-    #[allow(dead_code)]
-    pub(super) rating: String,
     pub(super) installed: bool,
     pub(super) installing: bool,
+}
+
+impl Extension {
+    pub(super) fn category(&self) -> ExtensionCategory {
+        match self.id.as_str() {
+            "prettier" => ExtensionCategory::Formatter,
+            "material-icons" => ExtensionCategory::IconTheme,
+            "dracula" => ExtensionCategory::ColorTheme,
+            _ => ExtensionCategory::Unknown,
+        }
+    }
 }
 
 pub(super) struct Tab {
@@ -172,7 +226,12 @@ pub(super) struct ExplorerRow {
 pub(super) fn is_c_family_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "c" | "cc" | "cpp" | "cxx"))
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "c" | "cc" | "cpp" | "cxx"
+            )
+        })
 }
 
 // LightLine's internal extension id for Material Icon Theme predates this
@@ -389,6 +448,8 @@ pub(super) struct App {
     pub(super) quick_open: bool,
     pub(super) quick_query: String,
     pub(super) quick_selected: usize,
+    // First Quick Open row on screen; moves to keep the selection visible.
+    pub(super) quick_first: usize,
     pub(super) quick_files: Vec<PathBuf>,
     pub(super) quick_loading: bool,
     pub(super) search_input: bool,
@@ -426,6 +487,9 @@ pub(super) struct App {
     pub(super) git_ahead: usize,
     pub(super) git_behind: usize,
     pub(super) git_conflicted: bool,
+    pub(super) git_staged_collapsed: bool,
+    pub(super) git_changes_collapsed: bool,
+    pub(super) git_history_collapsed: bool,
     pub(super) commit_message: String,
     pub(super) commit_focus: bool,
     // Set when Commit staged everything first, so the commit follows the stage
@@ -461,9 +525,24 @@ pub(super) struct App {
     pub(super) restoring: bool,
     pub(super) watcher: Option<lightline::watcher::FileWatcher>,
     pub(super) settings: lightline::settings::Settings,
-    pub(super) git_diff_cache: HashMap<PathBuf, (HashSet<usize>, HashSet<usize>)>,
+    pub(super) git_diff_cache: HashMap<PathBuf, GutterDiff>,
+    // HEAD's text per file, shared with gutter diff workers without copying.
+    pub(super) git_head_cache: HashMap<PathBuf, Arc<str>>,
+    // Bumped per gutter diff request; only the latest request's result is kept.
+    pub(super) gutter_generation: u64,
+    // The status text last painted and when it first appeared (see fresh_status).
+    pub(super) status_seen: RefCell<(String, Instant)>,
+    // The main window, for timers started from code paths without an HWND
+    // parameter (edits funnel through replace_range, which has none).
+    pub(super) hwnd: HWND,
+    // Files that are new relative to HEAD, whose every line is marked added.
+    pub(super) git_untracked: HashSet<PathBuf>,
+    // The repository's .git/index and .git/HEAD, watched so a commit, stage
+    // or checkout run in a terminal refreshes the Git panel and gutter.
+    pub(super) git_watch_files: Vec<PathBuf>,
     pub(super) extensions: Vec<Extension>,
     pub(super) extensions_tab: ExtensionsTab,
+    pub(super) extensions_filter: ExtensionsFilter,
     pub(super) extensions_query: String,
     pub(super) extensions_search_active: bool,
     pub(super) zed_registry_loaded: bool,
@@ -474,6 +553,10 @@ pub(super) struct App {
     pub(super) debug_state: DebugState,
     pub(super) debug_pending_root: Option<PathBuf>,
     pub(super) debug_pending_breakpoints: Vec<(PathBuf, Vec<u32>)>,
+    pub(super) debug_sections_expanded: [bool; 3],
+    // The configuration picked in the Run & Debug dropdown; None follows the
+    // active file (see App::auto_debug_config).
+    pub(super) debug_config: Option<DebugConfig>,
 }
 
 // Everything the Debug side panel paints, kept separate from the live
@@ -482,6 +565,11 @@ pub(super) struct App {
 #[derive(Default)]
 pub(super) struct DebugState {
     pub(super) status: String,
+    // What the current (or last) session launched; None before the first.
+    pub(super) config: Option<DebugConfig>,
+    // The script a Python session launched, so Restart relaunches that file
+    // rather than whichever tab is active by then.
+    pub(super) python_file: Option<PathBuf>,
     pub(super) running: bool,
     pub(super) thread_id: i64,
     pub(super) frames: Vec<DebugFrame>,
@@ -582,6 +670,30 @@ fn family_available(name: &str) -> bool {
         ReleaseDC(null_mut(), hdc);
         found
     }
+}
+
+// Gutter mark lines after an edit that replaced lines `start..=old_end` and
+// changed the line count by `delta`: marks above stay, marks below move by
+// `delta`, and marks on lines the edit removed are dropped.
+fn shifted_mark_lines(
+    lines: &HashSet<usize>,
+    start: usize,
+    old_end: usize,
+    delta: isize,
+) -> HashSet<usize> {
+    let new_end = old_end as isize + delta;
+    lines
+        .iter()
+        .filter_map(|&line| {
+            if line <= start {
+                Some(line)
+            } else if line > old_end {
+                usize::try_from(line as isize + delta).ok()
+            } else {
+                (line as isize <= new_end).then_some(line)
+            }
+        })
+        .collect()
 }
 
 impl App {
@@ -791,6 +903,7 @@ impl App {
             quick_open: false,
             quick_query: String::new(),
             quick_selected: 0,
+            quick_first: 0,
             quick_files: Vec::new(),
             quick_loading: false,
             search_input: false,
@@ -825,6 +938,9 @@ impl App {
             git_ahead: 0,
             git_behind: 0,
             git_conflicted: false,
+            git_staged_collapsed: false,
+            git_changes_collapsed: false,
+            git_history_collapsed: false,
             commit_message: String::new(),
             commit_focus: false,
             commit_after_stage: false,
@@ -857,6 +973,12 @@ impl App {
             watcher: Some(lightline::watcher::FileWatcher::start()),
             settings,
             git_diff_cache: HashMap::new(),
+            git_head_cache: HashMap::new(),
+            gutter_generation: 0,
+            status_seen: RefCell::new((String::new(), Instant::now())),
+            hwnd,
+            git_untracked: HashSet::new(),
+            git_watch_files: Vec::new(),
             extensions: vec![
                 Extension {
                     id: "prettier".into(),
@@ -864,8 +986,6 @@ impl App {
                     publisher: "esbenp".into(),
                     version: "v3.4.2".into(),
                     description: "Code formatter using prettier for JS, TS, HTML, CSS".into(),
-                    downloads: "42.8M".into(),
-                    rating: "★ 4.8".into(),
                     installed: false,
                     installing: false,
                 },
@@ -875,13 +995,21 @@ impl App {
                     publisher: "Zed Industries (zed-extensions/material-icon-theme)".into(),
                     version: "1.3.1".into(),
                     description: "Material Design file & folder icons, consumed from the real Zed extension registry".into(),
-                    downloads: "24.1M".into(),
-                    rating: "★ 4.9".into(),
                     installed: lightline::extensions::installer::is_installed("material-icon-theme"),
+                    installing: false,
+                },
+                Extension {
+                    id: "dracula".into(),
+                    name: "Dracula Theme".into(),
+                    publisher: "Dracula Team".into(),
+                    version: "Zed Registry".into(),
+                    description: "A dark color theme with vivid, accessible syntax colors".into(),
+                    installed: lightline::extensions::installer::is_installed("dracula"),
                     installing: false,
                 },
             ],
             extensions_tab: ExtensionsTab::Marketplace,
+            extensions_filter: ExtensionsFilter::Featured,
             extensions_query: String::new(),
             zed_registry_loaded: false,
             zed_registry_loading: false,
@@ -894,6 +1022,8 @@ impl App {
             },
             debug_pending_root: None,
             debug_pending_breakpoints: Vec::new(),
+            debug_sections_expanded: [true; 3],
+            debug_config: None,
             extensions_search_active: false,
         }
     }
@@ -916,7 +1046,8 @@ impl App {
 
     pub(super) fn filtered_extensions(&self) -> Vec<&Extension> {
         let q = self.extensions_query.trim().to_lowercase();
-        self.extensions
+        let mut visible: Vec<&Extension> = self
+            .extensions
             .iter()
             .filter(|ext| {
                 if self.extensions_tab == ExtensionsTab::Installed {
@@ -927,14 +1058,33 @@ impl App {
                     // entries LightLine ships knowledge of, not every id in
                     // the Zed registry the moment it's loaded -- the search
                     // box is what reveals the rest.
-                    return ext.id == "prettier" || ext.id == "material-icons";
+                    return matches!(ext.id.as_str(), "prettier" | "material-icons" | "dracula");
                 }
+                // Registry entries share one placeholder description and
+                // publisher, which would make "theme" or "zed" match all of
+                // them; only curated entries have real ones to search.
+                let described = ext.category() != ExtensionCategory::Unknown;
                 ext.id.to_lowercase().contains(&q)
                     || ext.name.to_lowercase().contains(&q)
-                    || ext.description.to_lowercase().contains(&q)
-                    || ext.publisher.to_lowercase().contains(&q)
+                    || (described && ext.description.to_lowercase().contains(&q))
+                    || (described && ext.publisher.to_lowercase().contains(&q))
             })
-            .collect()
+            .collect();
+        if q.is_empty() && self.extensions_tab == ExtensionsTab::Marketplace {
+            match self.extensions_filter {
+                ExtensionsFilter::Featured => {}
+                ExtensionsFilter::Themes => visible.retain(|ext| {
+                    matches!(
+                        ext.category(),
+                        ExtensionCategory::IconTheme | ExtensionCategory::ColorTheme
+                    )
+                }),
+                ExtensionsFilter::Formatters => {
+                    visible.retain(|ext| ext.category() == ExtensionCategory::Formatter)
+                }
+            }
+        }
+        visible
     }
 
     // Kicks off a one-time fetch of every id/version in the Zed registry, so
@@ -1003,13 +1153,10 @@ impl App {
                             return Ok(ExtensionInstallKind::IconTheme);
                         }
                         if lightline::extensions::zed_manifest::is_color_theme(&dir) {
-                            let Some(zed_theme) =
-                                lightline::color_theme::ZedColorTheme::load(&dir)
+                            let Some(zed_theme) = lightline::color_theme::ZedColorTheme::load(&dir)
                             else {
                                 let _ = lightline::extensions::installer::uninstall(&registry_id);
-                                return Err(
-                                    "its theme file could not be parsed".to_string()
-                                );
+                                return Err("its theme file could not be parsed".to_string());
                             };
                             let base = Theme::default_dark().with_overrides(&color_overrides);
                             let theme = Theme::from_zed_color_theme(&base, &zed_theme);
@@ -1146,7 +1293,9 @@ impl App {
     }
     pub(super) fn ai_width(&self, rect: RECT) -> i32 {
         if self.ai_assistant_visible {
-            self.scale(360).min((rect.right - self.editor_left()) / 2).max(self.scale(260))
+            self.scale(360)
+                .min((rect.right - self.editor_left()) / 2)
+                .max(self.scale(260))
         } else {
             0
         }
@@ -1164,7 +1313,6 @@ impl App {
             total_right
         }
     }
-
 
     pub(super) fn pane_divider(&self, hwnd: HWND) -> i32 {
         let right = self.editor_right(hwnd);
@@ -1324,6 +1472,9 @@ impl App {
             self.side_view = view;
             self.panel_focus = false;
             self.set_sidebar_visible(hwnd, true);
+            if view == SideView::Extensions {
+                self.ensure_zed_registry_loaded(hwnd);
+            }
         }
         self.show_active_tab(hwnd);
     }
@@ -1687,17 +1838,21 @@ impl App {
             return;
         }
         let visible = self.visible_lines(hwnd);
+        // The scrollbar counts screen rows, so folded lines don't inflate
+        // the range or push the thumb down.
+        let doc = self.doc();
         let info = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
             fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
             nMin: 0,
-            nMax: self
-                .doc()
-                .line_count()
+            nMax: doc
+                .visible_line_count()
                 .saturating_sub(1)
                 .min(i32::MAX as usize) as i32,
             nPage: visible as u32,
-            nPos: self.view().first_line.min(i32::MAX as usize) as i32,
+            nPos: doc
+                .visual_index(self.view().first_line)
+                .min(i32::MAX as usize) as i32,
             nTrackPos: 0,
         };
         unsafe {
@@ -1706,13 +1861,29 @@ impl App {
     }
 
     pub(super) fn keep_cursor_visible(&mut self, hwnd: HWND) {
+        // A minimized window has no rows; scrolling the caret into that view
+        // would leave the editor scrolled to the caret line after restoring.
+        if unsafe { IsIconic(hwnd) } != 0 {
+            return;
+        }
         let visible = self.visible_lines(hwnd);
         let line = self.view().cursor.line;
-        if line < self.view().first_line {
-            self.view_mut().first_line = line;
+        // The caret must never sit inside collapsed text, whatever moved it
+        // there (search, go to definition, undo): open the folds around it.
+        let anchor = self.view().selection_anchor;
+        let doc = self.doc_mut();
+        doc.unfold_to_reveal(line);
+        if let Some(anchor) = anchor {
+            doc.unfold_to_reveal(anchor.line);
         }
-        if line >= self.view().first_line + visible {
-            self.view_mut().first_line = line + 1 - visible;
+        let first = self.doc().visible_line_for(self.view().first_line);
+        self.view_mut().first_line = first;
+        if line < first {
+            self.view_mut().first_line = line;
+        } else if self.doc().visual_row_of(first, line, visible - 1).is_none() {
+            // Scroll so the caret is on the last row: `visible - 1` visible
+            // lines above it, skipping folded ones.
+            self.view_mut().first_line = self.doc().step_visible_lines(line, 1 - visible as isize);
         }
         self.update_scrollbar(hwnd);
         self.caret_on = true;
@@ -1789,7 +1960,11 @@ impl App {
         if self.tab().read_only() {
             return;
         }
+        let lines_before = self.doc().line_count();
         let cursor = self.doc_mut().replace(start, end, text);
+        let delta = self.doc().line_count() as isize - lines_before as isize;
+        self.shift_gutter_marks(start.line, end.line, delta);
+        self.schedule_gutter_diff();
         self.syntax_changed(start.line);
         self.view_mut().cursor = cursor;
         self.revalidate_other_view(Some((start, end, cursor)));
@@ -1933,12 +2108,23 @@ impl App {
     }
 
     pub(super) fn poll_watcher(&mut self, hwnd: HWND) {
-        let Some(watcher) = &self.watcher else { return; };
+        let Some(watcher) = &self.watcher else {
+            return;
+        };
         let events = watcher.poll();
-        if events.is_empty() { return; }
+        if events.is_empty() {
+            return;
+        }
         let mut needs_refresh = false;
+        let mut git_changed = false;
+        let visible = self.visible_lines(hwnd);
         for event in events {
             match event {
+                lightline::watcher::WatchEvent::FileChanged(path)
+                    if self.git_watch_files.contains(&path) =>
+                {
+                    git_changed = true;
+                }
                 lightline::watcher::WatchEvent::FileChanged(path) => {
                     for tab in &mut self.tabs {
                         if tab
@@ -1947,9 +2133,27 @@ impl App {
                             .as_deref()
                             .is_some_and(|p| Self::same_path(p, &path))
                         {
+                            // LightLine's own save also fires this event.
+                            // Reloading then would wipe the undo history and
+                            // replace the save's status message.
+                            if tab.document.disk_matches_last_save() {
+                                continue;
+                            }
                             if !tab.document.is_dirty() {
                                 if let Ok(doc) = Document::open(path.clone()) {
                                     tab.document = doc;
+                                    // The new text can be shorter: keep every
+                                    // cursor, selection and scroll inside it.
+                                    let last_line = tab.document.line_count().saturating_sub(1);
+                                    let last_page =
+                                        last_line.saturating_sub(visible.saturating_sub(1));
+                                    for view in &mut tab.views {
+                                        view.cursor = tab.document.clamp(view.cursor);
+                                        view.selection_anchor = view
+                                            .selection_anchor
+                                            .map(|anchor| tab.document.clamp(anchor));
+                                        view.first_line = view.first_line.min(last_page);
+                                    }
                                     if let Some(syntax) = &mut tab.syntax {
                                         syntax.invalidate_from(0);
                                     }
@@ -1971,7 +2175,9 @@ impl App {
                 }
                 lightline::watcher::WatchEvent::DirectoryChanged(dir) => {
                     self.directory_cache.remove(&dir);
-                    if self.workspace_root.as_ref() == Some(&dir) || self.expanded_dirs.contains(&dir) {
+                    if self.workspace_root.as_ref() == Some(&dir)
+                        || self.expanded_dirs.contains(&dir)
+                    {
                         self.load_directory(&dir);
                     }
                     needs_refresh = true;
@@ -1979,8 +2185,17 @@ impl App {
             }
         }
         if needs_refresh {
+            // A reload (e.g. after Discard) replaces the buffer without going
+            // through replace_range, so the gutter has to be recomputed here.
+            self.schedule_gutter_diff();
             self.backbuffer = None;
             unsafe { InvalidateRect(hwnd, null(), 0) };
+        }
+        // Something outside LightLine's own Git actions (which refresh when
+        // they finish) staged, committed or checked out -- e.g. in the
+        // built-in terminal, where the window never loses focus.
+        if git_changed && !self.git_busy {
+            self.refresh_git(hwnd);
         }
     }
 
@@ -1991,14 +2206,12 @@ impl App {
         let Some(path) = self.doc().path.clone() else {
             return;
         };
-        let Some(root) = self.git_root.clone().or_else(|| self.workspace_root.clone()) else {
+        // Only files inside a Git repository get change marks; a plain folder
+        // (or a file outside the repo) has nothing to compare against.
+        let Some(root) = self.git_root.clone() else {
             return;
         };
-        let Some(relative) = path.strip_prefix(&root).ok().map(Path::to_path_buf).or_else(|| {
-            self.workspace_root
-                .as_ref()
-                .and_then(|folder| path.strip_prefix(folder).ok().map(|rest| rest.to_path_buf()))
-        }) else {
+        let Some(relative) = repo_relative(&path, &root) else {
             return;
         };
         // Gutter marks compare the file on disk with HEAD, so unsaved edits do
@@ -2014,32 +2227,135 @@ impl App {
         let tx = self.worker_tx.clone();
         self.worker_started(hwnd);
         std::thread::spawn(move || {
+            let head_text = workflow::git_head_text(&root, &relative).ok();
             let result = workflow::git_diff(&root, &relative, DiffScope::Head);
-            let _ = tx.send(WorkerMessage::GutterDiff(path, relative, result));
+            let _ = tx.send(WorkerMessage::GutterDiff(path, relative, head_text, result));
         });
     }
 
-    pub(super) fn gutter_diff_finished(&mut self, path: &Path, result: Result<Vec<DiffRow>, String>) {
+    pub(super) fn gutter_diff_finished(
+        &mut self,
+        path: &Path,
+        head_text: Option<String>,
+        result: Result<Vec<DiffRow>, String>,
+    ) {
         if self.gutter_request.as_deref() != Some(path) {
             return;
         }
         self.gutter_request = None;
         self.gutter_done = Some(path.to_path_buf());
-        let Ok(rows) = result else {
-            return;
-        };
-        let mut added = HashSet::new();
-        let mut modified = HashSet::new();
-        for row in rows {
-            if row.changed && let Some(line) = row.after_number {
-                if row.before_number.is_none() {
-                    added.insert(line.saturating_sub(1));
-                } else {
-                    modified.insert(line.saturating_sub(1));
-                }
+        if let Some(text) = head_text {
+            self.git_untracked.remove(path);
+            self.git_head_cache.insert(path.to_path_buf(), text.into());
+        } else {
+            self.git_head_cache.remove(path);
+            // Not in HEAD. `git diff` lists a new (untracked or newly staged)
+            // file as all-added rows; anything else is an error, which shows
+            // no marks rather than a misleading all-green gutter.
+            if matches!(&result, Ok(rows) if rows.iter().all(|row| row.before_number.is_none())) {
+                self.git_untracked.insert(path.to_path_buf());
+            } else {
+                self.git_untracked.remove(path);
             }
         }
-        self.git_diff_cache.insert(path.to_path_buf(), (added, modified));
+        self.start_gutter_diff();
+    }
+
+    /// Asks for the active buffer's gutter marks to be recomputed once typing
+    /// pauses. Called after every edit: restarting the timer coalesces a burst
+    /// of keystrokes into a single diff.
+    /// The status message while it's fresh: shown for a few seconds after it
+    /// changes, so a stale "Saved x" doesn't sit in the status bar forever.
+    /// Paint calls this, so the change is tracked through a RefCell.
+    pub(super) fn fresh_status(&self) -> Option<&str> {
+        const VISIBLE: std::time::Duration = std::time::Duration::from_secs(5);
+        let mut seen = self.status_seen.borrow_mut();
+        if seen.0 != self.status {
+            *seen = (self.status.clone(), Instant::now());
+            if !self.status.is_empty() {
+                // Repaint once it expires so the message goes away on time.
+                unsafe {
+                    SetTimer(
+                        self.hwnd,
+                        STATUS_TIMER,
+                        VISIBLE.as_millis() as u32 + 50,
+                        None,
+                    )
+                };
+            }
+        }
+        (!self.status.is_empty() && seen.1.elapsed() < VISIBLE).then_some(self.status.as_str())
+    }
+
+    pub(super) fn schedule_gutter_diff(&mut self) {
+        unsafe { SetTimer(self.hwnd, GUTTER_DIFF_TIMER, 120, None) };
+    }
+
+    /// Moves the active buffer's gutter marks with an edit that replaced
+    /// lines `start..=old_end` and changed the line count by `delta`, so
+    /// they stay on their lines until the debounced recompute lands.
+    pub(super) fn shift_gutter_marks(&mut self, start: usize, old_end: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let Some(path) = self.doc().path.clone() else {
+            return;
+        };
+        let Some(diff) = self.git_diff_cache.get_mut(&path) else {
+            return;
+        };
+        for lines in [&mut diff.added, &mut diff.modified, &mut diff.deleted] {
+            *lines = shifted_mark_lines(lines, start, old_end, delta);
+        }
+    }
+
+    /// Recomputes the active buffer's gutter marks against its cached HEAD
+    /// text. The diff runs on a worker thread against a snapshot of the
+    /// buffer; `gutter_generation` discards a result that a newer request has
+    /// already superseded.
+    pub(super) fn start_gutter_diff(&mut self) {
+        const LIVE_GUTTER_LINE_LIMIT: usize = 50_000;
+        unsafe { KillTimer(self.hwnd, GUTTER_DIFF_TIMER) };
+        let Some(path) = self.doc().path.clone() else {
+            return;
+        };
+        self.gutter_generation += 1;
+        if self.doc().line_count() > LIVE_GUTTER_LINE_LIMIT {
+            self.git_diff_cache.remove(&path);
+        } else if let Some(head_text) = self.git_head_cache.get(&path).cloned() {
+            let lines = self.doc().lines().to_vec();
+            let generation = self.gutter_generation;
+            let tx = self.worker_tx.clone();
+            self.worker_started(self.hwnd);
+            std::thread::spawn(move || {
+                let diff = workflow::compute_gutter_diff(&head_text, &lines);
+                let _ = tx.send(WorkerMessage::GutterComputed(generation, path, diff));
+            });
+            return;
+        } else if self.git_untracked.contains(&path) {
+            let added = (0..self.doc().line_count()).collect();
+            self.git_diff_cache.insert(
+                path,
+                GutterDiff {
+                    added,
+                    ..GutterDiff::default()
+                },
+            );
+        } else {
+            self.git_diff_cache.remove(&path);
+        }
+        unsafe { InvalidateRect(self.hwnd, null(), 0) };
+    }
+
+    pub(super) fn gutter_diff_computed(
+        &mut self,
+        generation: u64,
+        path: PathBuf,
+        diff: GutterDiff,
+    ) {
+        if generation == self.gutter_generation {
+            self.git_diff_cache.insert(path, diff);
+        }
     }
 
     pub(super) fn error(&mut self, hwnd: HWND, error: &impl std::fmt::Display) {
@@ -2128,7 +2444,9 @@ impl App {
                 self.reveal_file_in_explorer(&path);
                 if let Some(parent) = path.parent() {
                     self.directory_cache.remove(parent);
-                    if self.expanded_dirs.contains(parent) || self.workspace_root.as_deref() == Some(parent) {
+                    if self.expanded_dirs.contains(parent)
+                        || self.workspace_root.as_deref() == Some(parent)
+                    {
                         self.load_directory(parent);
                     }
                 }
@@ -2136,6 +2454,12 @@ impl App {
                     "Saved {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
+                if lightline::settings::Settings::settings_path()
+                    .is_some_and(|settings| Self::same_path(&settings, &path))
+                    && self.reload_settings()
+                {
+                    self.status = "Settings saved and applied".into();
+                }
                 self.gutter_done = None;
                 self.refresh_active_git_diff(hwnd);
                 // A save is the moment a change appears or disappears, so the
@@ -2199,8 +2523,9 @@ impl App {
                 Ok(document) => Ok(Tab::new(document)),
                 // Not valid UTF-8 text and not a decodable image: fall back to
                 // a read-only hex dump instead of refusing to open the file.
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => std::fs::read(&path)
-                    .map(|bytes| Tab::new_binary_preview(path.clone(), &bytes)),
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    std::fs::read(&path).map(|bytes| Tab::new_binary_preview(path.clone(), &bytes))
+                }
                 Err(error) => Err(error),
             }
         };
@@ -2303,7 +2628,11 @@ mod split_tests {
     #[test]
     fn find_and_replace_all_replaces_all_occurrences() {
         let mut doc = Document::new();
-        doc.replace(Pos::default(), Pos::default(), "hello world hello rust hello");
+        doc.replace(
+            Pos::default(),
+            Pos::default(),
+            "hello world hello rust hello",
+        );
         let query = "hello";
         let replacement = "hi";
         let mut count = 0;
@@ -2333,8 +2662,6 @@ mod split_tests {
                 publisher: "esbenp".into(),
                 version: "v3.4.2".into(),
                 description: "Code formatter using prettier for JS, TS, HTML, CSS".into(),
-                downloads: "42.8M".into(),
-                rating: "★ 4.8".into(),
                 installed: false,
                 installing: false,
             },
@@ -2344,8 +2671,6 @@ mod split_tests {
                 publisher: "Philipp Kief".into(),
                 version: "v5.1.0".into(),
                 description: "Material Design file & folder icons for LightLine".into(),
-                downloads: "24.1M".into(),
-                rating: "★ 4.9".into(),
                 installed: true,
                 installing: false,
             },
@@ -2380,7 +2705,13 @@ mod split_tests {
 
     #[test]
     fn explorer_file_create_rename_delete() {
-        let temp_dir = std::env::temp_dir().join(format!("lightline_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lightline_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // Create file
@@ -2400,5 +2731,57 @@ mod split_tests {
 
         // Clean up temp dir
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn gutter_marks_move_with_inserted_and_deleted_lines() {
+        let marks: HashSet<usize> = [1, 5, 9].into_iter().collect();
+        let sorted = |set: HashSet<usize>| {
+            let mut lines: Vec<usize> = set.into_iter().collect();
+            lines.sort_unstable();
+            lines
+        };
+        // Enter on line 3: one line inserted after it; marks below move down.
+        assert_eq!(sorted(shifted_mark_lines(&marks, 3, 3, 1)), vec![1, 6, 10]);
+        // Lines 4..=6 joined into line 4 (two lines removed): the mark on
+        // removed line 5 goes, the one below moves up.
+        assert_eq!(sorted(shifted_mark_lines(&marks, 4, 6, -2)), vec![1, 7]);
+        // Undo of that: two lines re-inserted after line 4.
+        assert_eq!(
+            sorted(shifted_mark_lines(&[1, 7].into_iter().collect(), 4, 4, 2)),
+            vec![1, 9]
+        );
+    }
+
+    #[test]
+    fn repo_relative_matches_canonical_paths_against_git_roots() {
+        // An opened file (canonicalize() form) against Git's own root form.
+        assert_eq!(
+            repo_relative(
+                Path::new(r"\\?\C:\Work\repo\src\main.rs"),
+                Path::new("C:/Work/repo")
+            ),
+            Some(PathBuf::from(r"src\main.rs"))
+        );
+        // Case differences, as Windows paths are case-insensitive.
+        assert_eq!(
+            repo_relative(
+                Path::new(r"\\?\C:\work\Repo\a.rs"),
+                Path::new("C:/Work/repo")
+            ),
+            Some(PathBuf::from("a.rs"))
+        );
+        // A file outside the repository has no repo-relative path.
+        assert_eq!(
+            repo_relative(Path::new(r"\\?\C:\Other\a.rs"), Path::new("C:/Work/repo")),
+            None
+        );
+        assert_eq!(
+            repo_relative(
+                Path::new(r"C:\Work\repository\a.rs"),
+                Path::new("C:/Work/repo")
+            ),
+            None
+        );
     }
 }

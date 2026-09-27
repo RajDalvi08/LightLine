@@ -11,11 +11,11 @@ mod terminal;
 mod workspace;
 use app::{
     App, EditorView, ExplorerEntry, ExplorerInputState, ExplorerRow, Extension,
-    ExtensionInstallKind, ExtensionsTab, GitAction, SideView, Tab, TerminalPane, TerminalTab,
-    WorkerMessage, is_c_family_path, is_cpp_path,
+    ExtensionInstallKind, ExtensionsFilter, ExtensionsTab, GitAction, SideView, Tab, TerminalPane,
+    TerminalTab, WorkerMessage, is_c_family_path, is_cpp_path,
 };
 mod debugger;
-use debugger::DEBUG_EVENT_MESSAGE;
+use debugger::{DEBUG_EVENT_MESSAGE, DebugConfig};
 mod input;
 mod language;
 use language::LSP_EVENT_MESSAGE;
@@ -30,7 +30,7 @@ mod icons;
 mod theme;
 use theme::Theme;
 
-use icons::{AppIcons, GenericIcon, IconSet};
+use icons::{AppIcons, DebugGlyph, GenericIcon, IconSet};
 use lightline::clipboard;
 use lightline::debug::{
     Command as DebugCommand, DebugClient, Event as DebugEvent, Scope as DebugScope,
@@ -44,10 +44,12 @@ use lightline::lsp::{
 use lightline::syntax::{Color, Syntax};
 use lightline::terminal::{
     Cell, Color as TermColor, Key as TermKey, LaunchRequest, MAX_DRAIN_EVENTS,
-    Modifiers as TermModifiers, SessionId, SessionKind, SessionStatus, Snapshot, TerminalService,
-    TerminalSize,
+    Modifiers as TermModifiers, SessionId, SessionKind, SessionStatus, ShellKind, Snapshot,
+    TerminalService, TerminalSize,
 };
-pub use lightline::workflow::{self, Change, CommitEntry, DiffRow, DiffScope, RepoState, SearchHit};
+pub use lightline::workflow::{
+    self, Change, CommitEntry, DiffRow, DiffScope, GutterDiff, RepoState, SearchHit,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -96,6 +98,12 @@ const RAIL_ROW: i32 = 52;
 const CARD_GAP: i32 = 1;
 const CARD_RADIUS: i32 = 4;
 const TRANSITION_MS: u128 = 150;
+// WM_TIMER id for the debounced gutter diff (see schedule_gutter_diff).
+const GUTTER_DIFF_TIMER: usize = 8;
+// WM_TIMER id that repaints once a status message expires (see fresh_status).
+const STATUS_TIMER: usize = 9;
+// Rows the Quick Open list shows at once; longer lists scroll.
+const QUICK_ROWS: usize = 7;
 fn scaled(pixels: i32, dpi: u32, zoom: i32) -> i32 {
     ((pixels as i64 * dpi as i64 * zoom as i64 + 4800) / 9600) as i32
 }
@@ -106,6 +114,25 @@ fn display_path(path: &Path) -> String {
         .map(|rest| format!(r"\\{rest}"))
         .or_else(|| text.strip_prefix(r"\\?\").map(str::to_string))
         .unwrap_or(text)
+}
+// A file's path relative to a repository root. Opened files carry
+// canonicalize()'s `\\?\` form while Git reports its root as `C:/...`, so
+// both are reduced to the plain form first; names compare case-insensitively
+// as a fallback, the way Windows itself resolves them.
+fn repo_relative(path: &Path, root: &Path) -> Option<PathBuf> {
+    let plain = |p: &Path| PathBuf::from(display_path(p).replace('/', "\\"));
+    let (path, root) = (plain(path), plain(root));
+    if let Ok(rest) = path.strip_prefix(&root) {
+        return Some(rest.to_path_buf());
+    }
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let depth = lower(&path)
+        .strip_prefix(lower(&root))
+        .ok()?
+        .components()
+        .count();
+    let components: Vec<_> = path.components().collect();
+    Some(components[components.len() - depth..].iter().collect())
 }
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)

@@ -1,10 +1,62 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShellKind {
+    #[default]
+    PowerShell,
+    CommandPrompt,
+    GitBash,
+    Wsl,
+}
+
+impl ShellKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PowerShell => "PowerShell",
+            Self::CommandPrompt => "Command Prompt",
+            Self::GitBash => "Git Bash",
+            Self::Wsl => "WSL",
+        }
+    }
+
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::PowerShell => "pwsh",
+            Self::CommandPrompt => "cmd",
+            Self::GitBash => "bash",
+            Self::Wsl => "wsl",
+        }
+    }
+
+    pub fn all() -> &'static [ShellKind] {
+        &[
+            ShellKind::PowerShell,
+            ShellKind::CommandPrompt,
+            ShellKind::GitBash,
+            ShellKind::Wsl,
+        ]
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.resolve().is_ok()
+    }
+
+    pub fn resolve(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::PowerShell => resolve_powershell(),
+            Self::CommandPrompt => resolve_cmd(),
+            Self::GitBash => resolve_git_bash(),
+            Self::Wsl => resolve_wsl(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum LaunchRequest {
     Shell {
         cwd: PathBuf,
+        shell_kind: ShellKind,
         no_profile: bool,
     },
     Python {
@@ -19,6 +71,15 @@ impl LaunchRequest {
     pub fn shell(cwd: PathBuf) -> Self {
         Self::Shell {
             cwd,
+            shell_kind: ShellKind::PowerShell,
+            no_profile: false,
+        }
+    }
+
+    pub fn with_shell(cwd: PathBuf, shell_kind: ShellKind) -> Self {
+        Self::Shell {
+            cwd,
+            shell_kind,
             no_profile: false,
         }
     }
@@ -104,14 +165,207 @@ pub fn resolve_powershell() -> Result<PathBuf, String> {
     Err("PowerShell was not found in PATH, installed PowerShell directories, or System32".into())
 }
 
-pub fn prepare_launch(request: &LaunchRequest) -> Result<LaunchSpec, String> {
-    let executable = resolve_powershell()?;
-    prepare_with_shell(request, executable)
+pub fn resolve_cmd() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .unwrap_or_else(|| "C:\\Windows".into());
+    let path = PathBuf::from(root).join("System32").join("cmd.exe");
+    if is_real_executable(&path) {
+        return Ok(path);
+    }
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    for directory in std::env::split_paths(&paths) {
+        if directory.is_absolute() {
+            let candidate = directory.join("cmd.exe");
+            if is_real_executable(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err("Command Prompt (cmd.exe) was not found in System32 or PATH".into())
 }
 
-fn prepare_with_shell(request: &LaunchRequest, executable: PathBuf) -> Result<LaunchSpec, String> {
+pub fn resolve_git_bash() -> Result<PathBuf, String> {
+    for root_var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(root_var) {
+            let candidate = PathBuf::from(&root)
+                .join("Git")
+                .join("bin")
+                .join("bash.exe");
+            if is_real_executable(&candidate) {
+                return Ok(candidate);
+            }
+            let candidate_usr = PathBuf::from(&root)
+                .join("Git")
+                .join("usr")
+                .join("bin")
+                .join("bash.exe");
+            if is_real_executable(&candidate_usr) {
+                return Ok(candidate_usr);
+            }
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let candidate = PathBuf::from(&local)
+            .join("Programs")
+            .join("Git")
+            .join("bin")
+            .join("bash.exe");
+        if is_real_executable(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    for directory in std::env::split_paths(&paths) {
+        if directory.is_absolute() {
+            if directory.join("git.exe").is_file()
+                && let Some(parent) = directory.parent()
+            {
+                let candidate = parent.join("bin").join("bash.exe");
+                if is_real_executable(&candidate) {
+                    return Ok(candidate);
+                }
+                let candidate_usr = parent.join("usr").join("bin").join("bash.exe");
+                if is_real_executable(&candidate_usr) {
+                    return Ok(candidate_usr);
+                }
+            }
+            let candidate = directory.join("bash.exe");
+            if is_real_executable(&candidate) {
+                let lower = candidate.to_string_lossy().to_ascii_lowercase();
+                if !lower.contains("system32") {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err("Git Bash was not found in standard installation paths or PATH".into())
+}
+
+pub fn resolve_wsl() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .unwrap_or_else(|| "C:\\Windows".into());
+    let path = PathBuf::from(root).join("System32").join("wsl.exe");
+    let found = if is_real_executable(&path) {
+        Some(path)
+    } else {
+        let paths = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&paths)
+            .filter(|directory| directory.is_absolute())
+            .map(|directory| directory.join("wsl.exe"))
+            .find(|candidate| is_real_executable(candidate))
+    };
+    let Some(path) = found else {
+        return Err("WSL (wsl.exe) was not found in System32 or PATH".into());
+    };
+    // wsl.exe ships with Windows even when WSL has never been set up; without
+    // an installed distribution it only prints install instructions.
+    if !wsl_has_distribution() {
+        // Docker Desktop's internal distributions don't count (see
+        // is_user_distribution).
+        return Err("no Linux distribution installed; run `wsl --install`".into());
+    }
+    Ok(path)
+}
+
+fn wsl_has_distribution() -> bool {
+    wsl_distribution_names()
+        .iter()
+        .any(|name| is_user_distribution(name))
+}
+
+// Docker Desktop registers its own internal distributions (docker-desktop,
+// docker-desktop-data). A shell there is Docker's minimal VM, not a Linux
+// environment the user installed, so it doesn't make WSL "available".
+fn is_user_distribution(name: &str) -> bool {
+    !name.to_ascii_lowercase().starts_with("docker-desktop")
+}
+
+// Installed distributions are registered as subkeys of this key, each with
+// a DistributionName value. Reading the registry is instant, unlike running
+// `wsl -l`, which matters because availability is checked every time the
+// shell menu opens.
+#[cfg(windows)]
+fn wsl_distribution_names() -> Vec<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW,
+        RegOpenKeyExW,
+    };
+    let wide = |text: &str| {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let root = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Lxss");
+    let value = wide("DistributionName");
+    let mut names = Vec::new();
+    let mut key: HKEY = std::ptr::null_mut();
+    unsafe {
+        if RegOpenKeyExW(HKEY_CURRENT_USER, root.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+            return names;
+        }
+        for index in 0u32.. {
+            let mut subkey = [0u16; 256];
+            let mut subkey_len = subkey.len() as u32;
+            let status = RegEnumKeyExW(
+                key,
+                index,
+                subkey.as_mut_ptr(),
+                &mut subkey_len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if status != 0 {
+                break;
+            }
+            let mut name = [0u16; 256];
+            let mut size = std::mem::size_of_val(&name) as u32;
+            if RegGetValueW(
+                key,
+                subkey.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                name.as_mut_ptr().cast(),
+                &mut size,
+            ) == 0
+            {
+                // `size` is in bytes and includes the terminating NUL.
+                let len = (size as usize / 2).saturating_sub(1);
+                names.push(String::from_utf16_lossy(&name[..len]));
+            }
+        }
+        RegCloseKey(key);
+    }
+    names
+}
+
+#[cfg(not(windows))]
+fn wsl_distribution_names() -> Vec<String> {
+    Vec::new()
+}
+
+pub fn prepare_launch(request: &LaunchRequest) -> Result<LaunchSpec, String> {
+    let shell_kind = match request {
+        LaunchRequest::Shell { shell_kind, .. } => *shell_kind,
+        LaunchRequest::Python { .. } => ShellKind::PowerShell,
+    };
+    let executable = shell_kind.resolve()?;
+    prepare_with_shell(request, executable, shell_kind)
+}
+
+fn prepare_with_shell(
+    request: &LaunchRequest,
+    executable: PathBuf,
+    shell_kind: ShellKind,
+) -> Result<LaunchSpec, String> {
     let (cwd, no_profile) = match request {
-        LaunchRequest::Shell { cwd, no_profile }
+        LaunchRequest::Shell {
+            cwd, no_profile, ..
+        }
         | LaunchRequest::Python {
             cwd, no_profile, ..
         } => (cwd, *no_profile),
@@ -119,11 +373,16 @@ fn prepare_with_shell(request: &LaunchRequest, executable: PathBuf) -> Result<La
     let cwd = absolute_existing(cwd, true)?;
     let mut spec = LaunchSpec {
         executable,
-        arguments: vec![OsString::from("-NoLogo")],
+        arguments: match shell_kind {
+            ShellKind::PowerShell => vec![OsString::from("-NoLogo")],
+            ShellKind::CommandPrompt => Vec::new(),
+            ShellKind::GitBash => vec![OsString::from("--login"), OsString::from("-i")],
+            ShellKind::Wsl => Vec::new(),
+        },
         cwd,
         environment: Vec::new(),
     };
-    if no_profile {
+    if no_profile && shell_kind == ShellKind::PowerShell {
         spec.arguments.push(OsString::from("-NoProfile"));
     }
     if let LaunchRequest::Python {
@@ -314,6 +573,28 @@ pub fn quote_windows_argument(argument: &OsStr) -> Result<Vec<u16>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_desktop_distributions_do_not_count_as_wsl() {
+        assert!(!is_user_distribution("docker-desktop"));
+        assert!(!is_user_distribution("docker-desktop-data"));
+        assert!(!is_user_distribution("Docker-Desktop"));
+        assert!(is_user_distribution("Ubuntu"));
+        assert!(is_user_distribution("Ubuntu-22.04"));
+        assert!(is_user_distribution("dockerized-dev"));
+    }
+
+    #[test]
+    fn wsl_availability_matches_the_registered_distributions() {
+        // Machine-dependent: whatever is installed here, the availability
+        // answer must agree with the names read from the registry.
+        let names = wsl_distribution_names();
+        eprintln!("registered WSL distributions: {names:?}");
+        assert_eq!(
+            wsl_has_distribution(),
+            names.iter().any(|name| is_user_distribution(name))
+        );
+    }
 
     fn decode(encoded: &str) -> String {
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -17,8 +17,7 @@ impl App {
         };
         for index in 0..6 {
             let top = self.scale(RAIL_FIRST_ROW + index as i32 * RAIL_ROW);
-            let is_selected = selected == Some(index)
-                || (index == 5 && self.ai_assistant_visible);
+            let is_selected = selected == Some(index) || (index == 5 && self.ai_assistant_visible);
             if is_selected {
                 let pill = RECT {
                     left: self.scale(7),
@@ -48,7 +47,11 @@ impl App {
                 index,
                 self.scale(19),
                 top + self.scale(11),
-                if is_selected { rgb(56, 189, 248) } else { color },
+                if is_selected {
+                    rgb(56, 189, 248)
+                } else {
+                    color
+                },
             );
         }
         let name = "";
@@ -95,7 +98,6 @@ impl App {
         );
     }
 
-
     pub(in crate::windows_app) fn paint_side_panel(
         &self,
         hdc: HDC,
@@ -124,6 +126,34 @@ impl App {
             self.theme.muted,
             clip,
         );
+        if self.side_view == SideView::Debug {
+            Self::label(
+                hdc,
+                "\u{2699}",
+                editor_left - self.scale(62),
+                self.scale(10),
+                self.theme.muted,
+                clip,
+            );
+            Self::label(
+                hdc,
+                "\u{2026}",
+                editor_left - self.scale(32),
+                self.scale(7),
+                self.theme.muted,
+                clip,
+            );
+        }
+        if self.side_view == SideView::Extensions {
+            Self::label(
+                hdc,
+                "\u{21bb}",
+                editor_left - self.scale(36),
+                self.scale(8),
+                self.theme.muted,
+                clip,
+            );
+        }
         Self::fill(
             hdc,
             RECT {
@@ -549,18 +579,16 @@ impl App {
                 bottom,
             },
         );
-        // Capped at 7 (not the 8 rows the box has room for) so a full list never
-        // shares its last row with the "Type > for commands" hint below it.
+        // QUICK_ROWS rows are shown (not the 8 the box has room for) so the list
+        // never shares its last row with the hint line below it.
         let items: Vec<String> = if self.quick_query.starts_with('>') {
             self.quick_commands()
                 .iter()
-                .take(7)
                 .map(|(name, _)| format!(">  {name}"))
                 .collect()
         } else {
             self.quick_matches()
                 .iter()
-                .take(7)
                 .map(|path| {
                     path.strip_prefix(self.workspace_root.as_deref().unwrap_or(Path::new("")))
                         .unwrap_or(path)
@@ -569,8 +597,13 @@ impl App {
                 })
                 .collect()
         };
-        for (index, label) in items.iter().enumerate() {
-            let y = top + self.scale(68 + index as i32 * 34);
+        let shown = items
+            .iter()
+            .enumerate()
+            .skip(self.quick_first)
+            .take(QUICK_ROWS);
+        for (row, (index, label)) in shown.enumerate() {
+            let y = top + self.scale(68 + row as i32 * 34);
             if index == self.quick_selected {
                 Self::fill(
                     hdc,
@@ -618,10 +651,23 @@ impl App {
                 },
             );
         }
+        let mut hints = Vec::new();
         if !self.quick_query.starts_with('>') {
+            hints.push("Type > for commands".to_string());
+        }
+        if items.len() > QUICK_ROWS {
+            let last = (self.quick_first + QUICK_ROWS).min(items.len());
+            hints.push(format!(
+                "{}–{} of {}  ·  scroll for more",
+                self.quick_first + 1,
+                last,
+                items.len()
+            ));
+        }
+        if !hints.is_empty() {
             Self::label(
                 hdc,
-                "Type > for commands",
+                &hints.join("  ·  "),
                 left + self.scale(18),
                 bottom - self.scale(28),
                 self.theme.muted,
@@ -635,9 +681,28 @@ impl App {
         }
     }
 
-    // Geometry shared with the click handler in input.rs: four evenly-sized
-    // toolbar buttons (continue/pause, step over, step in, stop) above the
-    // live status line.
+    // The launch configuration selector left of the start button; clicking it
+    // opens show_debug_config_menu.
+    pub(in crate::windows_app) fn debug_config_rect(&self, left: i32, right: i32) -> RECT {
+        RECT {
+            left: left + self.scale(8),
+            top: self.scale(48),
+            right: right - self.scale(78),
+            bottom: self.scale(86),
+        }
+    }
+
+    pub(in crate::windows_app) fn debug_start_button(&self, right: i32) -> RECT {
+        RECT {
+            left: right - self.scale(70),
+            top: self.scale(48),
+            right: right - self.scale(8),
+            bottom: self.scale(86),
+        }
+    }
+
+    // Geometry shared with the click handler in input.rs: six compact debug
+    // controls below the launch configuration.
     pub(in crate::windows_app) fn debug_toolbar_button(
         &self,
         left: i32,
@@ -645,14 +710,14 @@ impl App {
         index: i32,
     ) -> RECT {
         let s = |v: i32| self.scale(v);
-        let gap = s(6);
-        let width = (right - left - s(16) - gap * 3) / 4;
+        let gap = s(5);
+        let width = (right - left - s(16) - gap * 5) / 6;
         let button_left = left + s(8) + index * (width + gap);
         RECT {
             left: button_left,
-            top: s(48),
+            top: s(94),
             right: button_left + width,
-            bottom: s(78),
+            bottom: s(130),
         }
     }
 
@@ -660,80 +725,28 @@ impl App {
     // Unicode symbols a first draft of this toolbar used, which rendered as
     // blank tofu boxes. Simple GDI shapes always render, and match how the
     // Python "Run" arrow in the tab strip is already drawn.
+    // `index`: 0 start/play, 1 step over, 2 step into, 3 pause, anything else stop.
     fn debug_icon(&self, hdc: HDC, rect: RECT, index: i32, color: u32) {
-        let cx = (rect.left + rect.right) / 2;
-        let cy = (rect.top + rect.bottom) / 2;
-        let r = self.scale(6);
-        unsafe {
-            let brush = CreateSolidBrush(color);
-            let pen = CreatePen(PS_SOLID, self.scale(2).max(1), color);
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            match index {
-                // Continue/resume: a plain right-pointing triangle.
-                0 => {
-                    let points = [
-                        POINT { x: cx - r + self.scale(1), y: cy - r },
-                        POINT { x: cx - r + self.scale(1), y: cy + r },
-                        POINT { x: cx + r, y: cy },
-                    ];
-                    Polygon(hdc, points.as_ptr(), 3);
-                }
-                // Step over: a rightward arrow.
-                1 => {
-                    MoveToEx(hdc, cx - r, cy, null_mut());
-                    LineTo(hdc, cx + r - self.scale(2), cy);
-                    let head = [
-                        POINT { x: cx + r - self.scale(4), y: cy - self.scale(4) },
-                        POINT { x: cx + r, y: cy },
-                        POINT { x: cx + r - self.scale(4), y: cy + self.scale(4) },
-                    ];
-                    SelectObject(hdc, GetStockObject(NULL_PEN));
-                    Polygon(hdc, head.as_ptr(), 3);
-                }
-                // Step in: a downward arrow.
-                2 => {
-                    MoveToEx(hdc, cx, cy - r, null_mut());
-                    LineTo(hdc, cx, cy + r - self.scale(2));
-                    let head = [
-                        POINT { x: cx - self.scale(4), y: cy + r - self.scale(4) },
-                        POINT { x: cx, y: cy + r },
-                        POINT { x: cx + self.scale(4), y: cy + r - self.scale(4) },
-                    ];
-                    SelectObject(hdc, GetStockObject(NULL_PEN));
-                    Polygon(hdc, head.as_ptr(), 3);
-                }
-                // Pause: two vertical bars, shown on the first slot while running.
-                3 => {
-                    let bar = self.scale(3);
-                    FillRect(
-                        hdc,
-                        &RECT { left: cx - r, top: cy - r, right: cx - r + bar, bottom: cy + r },
-                        brush,
-                    );
-                    FillRect(
-                        hdc,
-                        &RECT { left: cx + r - bar, top: cy - r, right: cx + r, bottom: cy + r },
-                        brush,
-                    );
-                }
-                // Stop: a filled square.
-                _ => {
-                    FillRect(
-                        hdc,
-                        &RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r },
-                        brush,
-                    );
-                }
-            }
-            SelectObject(hdc, old_pen);
-            SelectObject(hdc, old_brush);
-            DeleteObject(brush);
-            DeleteObject(pen);
-        }
+        let glyph = match index {
+            0 => DebugGlyph::Start,
+            1 => DebugGlyph::StepOver,
+            2 => DebugGlyph::StepInto,
+            3 => DebugGlyph::Pause,
+            _ => DebugGlyph::Stop,
+        };
+        self.debug_glyph(hdc, rect, glyph, color);
     }
 
-    fn paint_debug_panel(&self, hdc: HDC, left: i32, right: i32, bottom: i32, clip: RECT) {
+    // Centres `glyph` in `rect`.
+    fn debug_glyph(&self, hdc: HDC, rect: RECT, glyph: DebugGlyph, color: u32) {
+        let size = self.scale(20);
+        let x = (rect.left + rect.right - size) / 2;
+        let y = (rect.top + rect.bottom - size) / 2;
+        self.icons.draw_glyph(hdc, glyph, color, x, y, size);
+    }
+
+    #[allow(dead_code)]
+    fn paint_debug_panel_legacy(&self, hdc: HDC, left: i32, right: i32, bottom: i32, clip: RECT) {
         let s = |v: i32| self.scale(v);
         let state = &self.debug_state;
         let has_session = self.debug.is_some();
@@ -750,7 +763,16 @@ impl App {
             let rect = self.debug_toolbar_button(left, right, index as i32);
             let active_color = if *enabled { *color } else { disabled };
             self.panel_card(hdc, rect, s(5), active_color, rgb(16, 24, 44));
-            self.debug_icon(hdc, rect, *icon, if *enabled { rgb(255, 255, 255) } else { disabled });
+            self.debug_icon(
+                hdc,
+                rect,
+                *icon,
+                if *enabled {
+                    rgb(255, 255, 255)
+                } else {
+                    disabled
+                },
+            );
         }
 
         let mut y = s(88);
@@ -781,13 +803,34 @@ impl App {
             left + s(20),
             y,
             status_color,
-            RECT { left, top: clip.top, right: right - s(8), bottom: clip.bottom },
+            RECT {
+                left,
+                top: clip.top,
+                right: right - s(8),
+                bottom: clip.bottom,
+            },
         );
         y += s(24);
 
         // 1. VARIABLES
-        Self::fill(hdc, RECT { left, top: y, right, bottom: y + s(22) }, self.theme.active_bg);
-        Self::label(hdc, "▼ VARIABLES", left + s(8), y + s(3), rgb(80, 160, 220), clip);
+        Self::fill(
+            hdc,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + s(22),
+            },
+            self.theme.active_bg,
+        );
+        Self::label(
+            hdc,
+            "▼ VARIABLES",
+            left + s(8),
+            y + s(3),
+            rgb(80, 160, 220),
+            clip,
+        );
         y += s(24);
 
         if state.scopes.is_empty() {
@@ -802,7 +845,14 @@ impl App {
                     continue;
                 }
                 if row.loading {
-                    Self::label(hdc, &row.name, left + s(20) + indent, row.y, self.theme.muted, clip);
+                    Self::label(
+                        hdc,
+                        &row.name,
+                        left + s(20) + indent,
+                        row.y,
+                        self.theme.muted,
+                        clip,
+                    );
                     continue;
                 }
                 // Only an expandable variable gets an arrow; a plain value
@@ -815,14 +865,26 @@ impl App {
                 } else {
                     "\u{25b8}"
                 };
-                Self::label(hdc, glyph, left + s(8) + indent, row.y, self.theme.muted, clip);
+                Self::label(
+                    hdc,
+                    glyph,
+                    left + s(8) + indent,
+                    row.y,
+                    self.theme.muted,
+                    clip,
+                );
                 self.label_ellipsis(
                     hdc,
                     &row.name,
                     left + s(20) + indent,
                     row.y,
                     rgb(205, 220, 245),
-                    RECT { left, top: clip.top, right: right - s(96), bottom: clip.bottom },
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(96),
+                        bottom: clip.bottom,
+                    },
                 );
                 self.label_ellipsis(
                     hdc,
@@ -830,7 +892,12 @@ impl App {
                     right - s(92),
                     row.y,
                     rgb(130, 150, 180),
-                    RECT { left, top: clip.top, right: right - s(8), bottom: clip.bottom },
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(8),
+                        bottom: clip.bottom,
+                    },
                 );
             }
             y = next_y;
@@ -839,8 +906,24 @@ impl App {
         y += s(6);
         // 2. CALL STACK
         if y + s(28) <= bottom {
-            Self::fill(hdc, RECT { left, top: y, right, bottom: y + s(22) }, self.theme.active_bg);
-            Self::label(hdc, "▼ CALL STACK", left + s(8), y + s(3), rgb(80, 160, 220), clip);
+            Self::fill(
+                hdc,
+                RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + s(22),
+                },
+                self.theme.active_bg,
+            );
+            Self::label(
+                hdc,
+                "▼ CALL STACK",
+                left + s(8),
+                y + s(3),
+                rgb(80, 160, 220),
+                clip,
+            );
             y += s(24);
             if state.frames.is_empty() {
                 Self::label(hdc, "Not stopped", left + s(8), y, self.theme.muted, clip);
@@ -862,7 +945,12 @@ impl App {
                     left + s(8),
                     y,
                     self.theme.text,
-                    RECT { left, top: clip.top, right: right - s(94), bottom: clip.bottom },
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(94),
+                        bottom: clip.bottom,
+                    },
                 );
                 Self::label(hdc, &location, right - s(90), y, self.theme.muted, clip);
                 y += s(18);
@@ -872,20 +960,49 @@ impl App {
         y += s(6);
         // 3. BREAKPOINTS
         if y + s(28) <= bottom {
-            Self::fill(hdc, RECT { left, top: y, right, bottom: y + s(22) }, self.theme.active_bg);
-            Self::label(hdc, "▼ BREAKPOINTS", left + s(8), y + s(3), rgb(80, 160, 220), clip);
+            Self::fill(
+                hdc,
+                RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + s(22),
+                },
+                self.theme.active_bg,
+            );
+            Self::label(
+                hdc,
+                "▼ BREAKPOINTS",
+                left + s(8),
+                y + s(3),
+                rgb(80, 160, 220),
+                clip,
+            );
             y += s(24);
             let breakpoints: Vec<(String, usize)> = self
                 .tabs
                 .iter()
                 .filter_map(|tab| {
-                    let name = tab.document.path.as_ref()?.file_name()?.to_string_lossy().into_owned();
+                    let name = tab
+                        .document
+                        .path
+                        .as_ref()?
+                        .file_name()?
+                        .to_string_lossy()
+                        .into_owned();
                     Some((name, tab.document.breakpoints()))
                 })
                 .flat_map(|(name, lines)| lines.iter().map(move |line| (name.clone(), line + 1)))
                 .collect();
             if breakpoints.is_empty() {
-                Self::label(hdc, "Click a line's gutter to add one", left + s(8), y, self.theme.muted, clip);
+                Self::label(
+                    hdc,
+                    "Click a line's gutter to add one",
+                    left + s(8),
+                    y,
+                    self.theme.muted,
+                    clip,
+                );
             }
             for (name, line) in &breakpoints {
                 if y + s(18) > bottom {
@@ -906,14 +1023,556 @@ impl App {
                     left + s(24),
                     y,
                     self.theme.text,
-                    RECT { left, top: clip.top, right: right - s(8), bottom: clip.bottom },
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(8),
+                        bottom: clip.bottom,
+                    },
                 );
                 y += s(18);
             }
         }
     }
 
-    fn paint_extensions_panel(&self, hdc: HDC, left: i32, right: i32, bottom: i32, clip: RECT) {
+    // The session toolbar, left to right: continue (pause while running),
+    // step over, step into, step out, restart, stop.
+    fn debug_control_icon(&self, hdc: HDC, rect: RECT, index: usize, running: bool, color: u32) {
+        let glyph = match index {
+            0 if running => DebugGlyph::Pause,
+            0 => DebugGlyph::Continue,
+            1 => DebugGlyph::StepOver,
+            2 => DebugGlyph::StepInto,
+            3 => DebugGlyph::StepOut,
+            4 => DebugGlyph::Restart,
+            _ => DebugGlyph::Stop,
+        };
+        self.debug_glyph(hdc, rect, glyph, color);
+    }
+
+    fn paint_debug_panel(&self, hdc: HDC, left: i32, right: i32, bottom: i32, clip: RECT) {
+        let s = |v: i32| self.scale(v);
+        let state = &self.debug_state;
+        let has_session = self.debug.is_some();
+        let running = has_session && state.running;
+        let paused = self.debug_paused();
+
+        let config = self.debug_config_rect(left, right);
+        self.panel_card(hdc, config, s(5), rgb(42, 65, 105), rgb(13, 23, 42));
+        // A session shows what it launched; otherwise what F5 would launch now.
+        let shown_config = if has_session || self.debug_pending_root.is_some() {
+            state.config
+        } else {
+            self.effective_debug_config()
+        };
+        let (config_label, config_color) = match shown_config {
+            Some(config) => (config.label(), self.theme.text),
+            None => ("No configuration", self.theme.muted),
+        };
+        self.label_ellipsis(
+            hdc,
+            config_label,
+            config.left + s(12),
+            s(56),
+            config_color,
+            RECT {
+                left: config.left,
+                top: clip.top,
+                right: config.right - s(28),
+                bottom: clip.bottom,
+            },
+        );
+        self.chevron(
+            hdc,
+            config.right - s(14),
+            (config.top + config.bottom) / 2,
+            false,
+        );
+        let start = self.debug_start_button(right);
+        self.panel_card(
+            hdc,
+            start,
+            s(5),
+            if has_session {
+                rgb(38, 55, 79)
+            } else {
+                rgb(34, 197, 94)
+            },
+            if has_session {
+                rgb(16, 25, 43)
+            } else {
+                rgb(13, 57, 46)
+            },
+        );
+        self.debug_icon(
+            hdc,
+            start,
+            0,
+            if has_session {
+                rgb(66, 82, 110)
+            } else {
+                rgb(245, 255, 250)
+            },
+        );
+
+        if has_session {
+            for index in 0..6 {
+                let enabled = match index {
+                    0 => true,
+                    1..=3 => paused,
+                    _ => true,
+                };
+                let rect = self.debug_toolbar_button(left, right, index as i32);
+                self.panel_card(
+                    hdc,
+                    rect,
+                    s(5),
+                    if enabled {
+                        rgb(48, 78, 126)
+                    } else {
+                        rgb(31, 43, 67)
+                    },
+                    rgb(15, 24, 43),
+                );
+                let color = if !enabled {
+                    rgb(66, 82, 110)
+                } else if index == 5 {
+                    rgb(245, 92, 92)
+                } else {
+                    rgb(170, 202, 250)
+                };
+                self.debug_control_icon(hdc, rect, index, running, color);
+            }
+        }
+
+        let status_top = if has_session { s(140) } else { s(94) };
+        let status_rect = RECT {
+            left: left + s(8),
+            top: status_top,
+            right: right - s(8),
+            bottom: status_top + s(58),
+        };
+        self.panel_card(hdc, status_rect, s(6), rgb(38, 58, 91), rgb(15, 27, 49));
+        let failed = state.status.starts_with("Build failed")
+            || state.status.starts_with("Could not")
+            || state.status.contains("not found")
+            || state.status.contains("not installed")
+            || state.status.contains("closed its output")
+            || state.status.contains("error");
+        let dot_color = if failed {
+            rgb(220, 60, 60)
+        } else if running || paused {
+            rgb(49, 211, 118)
+        } else {
+            self.theme.muted
+        };
+        let (title, detail) = if running {
+            ("Running".to_string(), "Debug session active".to_string())
+        } else if paused {
+            let detail = state
+                .frames
+                .first()
+                .and_then(|frame| {
+                    let name = frame.path.as_ref()?.file_name()?.to_string_lossy();
+                    Some(format!("{name} \u{00b7} line {}", frame.line))
+                })
+                .unwrap_or_else(|| state.status.clone());
+            ("Paused".to_string(), detail)
+        } else if has_session {
+            let adapter = state.config.map_or("LLDB", DebugConfig::adapter_name);
+            (state.status.clone(), format!("Launching with {adapter}"))
+        } else if self.effective_debug_config().is_none() {
+            (
+                "Nothing to debug".to_string(),
+                "Only Rust and Python supported".to_string(),
+            )
+        } else if state.status.is_empty()
+            || state.status == "Not running"
+            || state.status == "Program exited"
+        {
+            match self.effective_debug_config() {
+                Some(DebugConfig::RustWorkspace) => (
+                    "Ready to debug".to_string(),
+                    "Builds and debugs the Cargo workspace".to_string(),
+                ),
+                Some(DebugConfig::PythonFile) => (
+                    "Ready to debug".to_string(),
+                    "Debugs the active Python file".to_string(),
+                ),
+                None => (
+                    "Nothing to debug".to_string(),
+                    "Only Rust and Python supported".to_string(),
+                ),
+            }
+        } else if state.status.contains("debugpy is not installed") {
+            (
+                "debugpy is not installed".to_string(),
+                "Ctrl+P > Python: Install debugpy".to_string(),
+            )
+        } else {
+            (state.status.clone(), "Debugger is not active".to_string())
+        };
+        unsafe {
+            let brush = CreateSolidBrush(dot_color);
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            Ellipse(
+                hdc,
+                status_rect.left + s(12),
+                status_rect.top + s(13),
+                status_rect.left + s(21),
+                status_rect.top + s(22),
+            );
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(brush);
+        }
+        self.label_ellipsis(
+            hdc,
+            &title,
+            status_rect.left + s(29),
+            status_rect.top + s(7),
+            self.theme.text,
+            RECT {
+                left,
+                top: clip.top,
+                right: status_rect.right - s(94),
+                bottom: clip.bottom,
+            },
+        );
+        Self::label(
+            hdc,
+            &detail,
+            status_rect.left + s(29),
+            status_rect.top + s(26),
+            self.theme.muted,
+            clip,
+        );
+        if has_session {
+            let adapter = state.config.map_or("LLDB", DebugConfig::adapter_name);
+            let width = self.text_width(hdc, adapter);
+            Self::label(
+                hdc,
+                adapter,
+                status_rect.right - s(12) - width,
+                status_rect.top + s(7),
+                self.theme.muted,
+                clip,
+            );
+        }
+
+        let layout = self.debug_panel_layout(bottom);
+        let breakpoint_count: usize = self
+            .tabs
+            .iter()
+            .map(|tab| tab.document.breakpoints().len())
+            .sum();
+        let headers = [
+            (
+                layout.variables_header_y,
+                "VARIABLES",
+                state
+                    .scopes
+                    .iter()
+                    .map(|scope| scope.variables.len())
+                    .sum::<usize>(),
+            ),
+            (layout.call_stack_header_y, "CALL STACK", state.frames.len()),
+            (layout.breakpoints_header_y, "BREAKPOINTS", breakpoint_count),
+        ];
+        for (index, (y, title, count)) in headers.iter().enumerate() {
+            if *y + s(28) > bottom {
+                continue;
+            }
+            Self::fill(
+                hdc,
+                RECT {
+                    left,
+                    top: *y,
+                    right,
+                    bottom: *y + s(28),
+                },
+                self.theme.active_bg,
+            );
+            Self::label(
+                hdc,
+                if self.debug_sections_expanded[index] {
+                    "\u{25be}"
+                } else {
+                    "\u{25b8}"
+                },
+                left + s(8),
+                *y + s(5),
+                rgb(86, 164, 225),
+                clip,
+            );
+            Self::label(hdc, title, left + s(24), *y + s(5), rgb(86, 164, 225), clip);
+            let badge = RECT {
+                left: right - s(35),
+                top: *y + s(4),
+                right: right - s(10),
+                bottom: *y + s(24),
+            };
+            self.panel_card(hdc, badge, s(9), rgb(48, 70, 108), rgb(24, 40, 69));
+            Self::label(
+                hdc,
+                &count.to_string(),
+                badge.left + s(8),
+                *y + s(5),
+                rgb(205, 220, 245),
+                clip,
+            );
+        }
+
+        if self.debug_sections_expanded[0] {
+            if state.scopes.is_empty() {
+                Self::label(
+                    hdc,
+                    "Variables appear when execution pauses.",
+                    left + s(12),
+                    layout.variables_body_y + s(7),
+                    self.theme.muted,
+                    clip,
+                );
+            }
+            for row in &layout.variable_rows {
+                let indent = s(12) * row.depth as i32;
+                if row.is_header {
+                    Self::label(
+                        hdc,
+                        "\u{25be}",
+                        left + s(12),
+                        row.y + s(2),
+                        self.theme.muted,
+                        clip,
+                    );
+                    Self::label(
+                        hdc,
+                        &row.name,
+                        left + s(28),
+                        row.y + s(2),
+                        self.theme.text,
+                        clip,
+                    );
+                    continue;
+                }
+                if row.loading {
+                    Self::label(
+                        hdc,
+                        &row.name,
+                        left + s(27) + indent,
+                        row.y + s(2),
+                        self.theme.muted,
+                        clip,
+                    );
+                    continue;
+                }
+                let glyph = if !row.expandable {
+                    " "
+                } else if row.expanded {
+                    "\u{25be}"
+                } else {
+                    "\u{25b8}"
+                };
+                Self::fill(
+                    hdc,
+                    RECT {
+                        left: left + s(8),
+                        top: row.y + s(22),
+                        right: right - s(8),
+                        bottom: row.y + s(23),
+                    },
+                    rgb(27, 40, 64),
+                );
+                Self::label(
+                    hdc,
+                    glyph,
+                    left + s(12) + indent,
+                    row.y + s(2),
+                    self.theme.muted,
+                    clip,
+                );
+                self.label_ellipsis(
+                    hdc,
+                    &row.name,
+                    left + s(27) + indent,
+                    row.y + s(2),
+                    rgb(205, 220, 245),
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(130),
+                        bottom: clip.bottom,
+                    },
+                );
+                self.label_ellipsis(
+                    hdc,
+                    &row.value,
+                    right - s(126),
+                    row.y + s(2),
+                    if row.value.starts_with('"') {
+                        rgb(230, 155, 90)
+                    } else {
+                        rgb(65, 205, 220)
+                    },
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(8),
+                        bottom: clip.bottom,
+                    },
+                );
+            }
+        }
+
+        if self.debug_sections_expanded[1] && layout.call_stack_body_y < bottom {
+            let mut y = layout.call_stack_body_y + s(3);
+            if state.frames.is_empty() {
+                Self::label(
+                    hdc,
+                    "Call stack appears during a debug session.",
+                    left + s(12),
+                    y + s(4),
+                    self.theme.muted,
+                    clip,
+                );
+            }
+            for (index, frame) in state.frames.iter().take(5).enumerate() {
+                if y + s(23) > bottom {
+                    break;
+                }
+                if index == 0 {
+                    self.panel_card(
+                        hdc,
+                        RECT {
+                            left: left + s(8),
+                            top: y,
+                            right: right - s(8),
+                            bottom: y + s(22),
+                        },
+                        s(3),
+                        rgb(39, 91, 160),
+                        rgb(22, 57, 108),
+                    );
+                }
+                let location = frame
+                    .path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|name| format!("{}:{}", name.to_string_lossy(), frame.line))
+                    .unwrap_or_default();
+                self.label_ellipsis(
+                    hdc,
+                    &frame.name,
+                    left + s(16),
+                    y + s(2),
+                    self.theme.text,
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(110),
+                        bottom: clip.bottom,
+                    },
+                );
+                Self::label(
+                    hdc,
+                    &location,
+                    right - s(105),
+                    y + s(2),
+                    self.theme.muted,
+                    clip,
+                );
+                y += s(23);
+            }
+        }
+
+        if self.debug_sections_expanded[2] && layout.breakpoints_body_y < bottom {
+            let mut y = layout.breakpoints_body_y + s(5);
+            let breakpoints: Vec<(String, usize)> = self
+                .tabs
+                .iter()
+                .filter_map(|tab| {
+                    let name = tab
+                        .document
+                        .path
+                        .as_ref()?
+                        .file_name()?
+                        .to_string_lossy()
+                        .into_owned();
+                    Some((name, tab.document.breakpoints()))
+                })
+                .flat_map(|(name, lines)| lines.iter().map(move |line| (name.clone(), line + 1)))
+                .collect();
+            if breakpoints.is_empty() {
+                Self::label(
+                    hdc,
+                    "Click the editor gutter or press F9 to add one.",
+                    left + s(12),
+                    y + s(3),
+                    self.theme.muted,
+                    clip,
+                );
+            }
+            for (name, line) in &breakpoints {
+                if y + s(24) > bottom {
+                    break;
+                }
+                self.panel_card(
+                    hdc,
+                    RECT {
+                        left: left + s(10),
+                        top: y + s(2),
+                        right: left + s(27),
+                        bottom: y + s(19),
+                    },
+                    s(3),
+                    rgb(45, 115, 196),
+                    rgb(32, 116, 210),
+                );
+                Self::label(
+                    hdc,
+                    "\u{2713}",
+                    left + s(13),
+                    y + s(1),
+                    rgb(245, 250, 255),
+                    clip,
+                );
+                unsafe {
+                    let brush = CreateSolidBrush(rgb(245, 82, 82));
+                    let old_brush = SelectObject(hdc, brush);
+                    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                    Ellipse(hdc, left + s(35), y + s(7), left + s(44), y + s(16));
+                    SelectObject(hdc, old_pen);
+                    SelectObject(hdc, old_brush);
+                    DeleteObject(brush);
+                }
+                self.label_ellipsis(
+                    hdc,
+                    &format!("{name}:{line}"),
+                    left + s(52),
+                    y + s(4),
+                    self.theme.text,
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(8),
+                        bottom: clip.bottom,
+                    },
+                );
+                y += s(24);
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn paint_extensions_panel_legacy(
+        &self,
+        hdc: HDC,
+        left: i32,
+        right: i32,
+        bottom: i32,
+        clip: RECT,
+    ) {
         let s = |v: i32| self.scale(v);
 
         // 1. VS Code style Search bar with vector icon and filter
@@ -939,7 +1598,13 @@ impl App {
             rgb(100, 116, 145)
         };
         self.stroke(hdc, icon_color, |hdc| unsafe {
-            Ellipse(hdc, icon_cx - s(4), icon_cy - s(4), icon_cx + s(4), icon_cy + s(4));
+            Ellipse(
+                hdc,
+                icon_cx - s(4),
+                icon_cy - s(4),
+                icon_cx + s(4),
+                icon_cy + s(4),
+            );
             MoveToEx(hdc, icon_cx + s(3), icon_cy + s(3), null_mut());
             LineTo(hdc, icon_cx + s(7), icon_cy + s(7));
         });
@@ -1079,7 +1744,14 @@ impl App {
             ("POPULAR", visible.len())
         };
         let sec_text = format!("▾  {section_title} ({section_count})");
-        Self::label(hdc, &sec_text, left + s(12), section_y, rgb(110, 130, 160), clip);
+        Self::label(
+            hdc,
+            &sec_text,
+            left + s(12),
+            section_y,
+            rgb(110, 130, 160),
+            clip,
+        );
         let sec_w = self.text_width(hdc, &sec_text);
         Self::fill(
             hdc,
@@ -1106,7 +1778,14 @@ impl App {
             } else {
                 format!("No extensions match \"{query}\"")
             };
-            Self::label(hdc, &notice, left + s(16), ey + s(12), self.theme.muted, clip);
+            Self::label(
+                hdc,
+                &notice,
+                left + s(16),
+                ey + s(12),
+                self.theme.muted,
+                clip,
+            );
             // This isn't a real marketplace search yet, just a small curated
             // list; say so instead of leaving an unexplained blank panel that
             // reads as "search is broken".
@@ -1153,20 +1832,79 @@ impl App {
                 let stripe_h = s(3);
                 let sw = s(6);
                 let sx0 = icon_rect.left + s(7);
-                Self::fill(hdc, RECT { left: sx0, top: stripe_y, right: sx0 + sw, bottom: stripe_y + stripe_h }, rgb(86, 182, 240));
-                Self::fill(hdc, RECT { left: sx0 + sw + s(1), top: stripe_y, right: sx0 + sw * 2 + s(1), bottom: stripe_y + stripe_h }, rgb(236, 72, 153));
-                Self::fill(hdc, RECT { left: sx0 + sw * 2 + s(2), top: stripe_y, right: sx0 + sw * 3 + s(2), bottom: stripe_y + stripe_h }, rgb(245, 197, 24));
-                Self::fill(hdc, RECT { left: sx0 + sw * 3 + s(3), top: stripe_y, right: sx0 + sw * 4 + s(3), bottom: stripe_y + stripe_h }, rgb(168, 85, 247));
+                Self::fill(
+                    hdc,
+                    RECT {
+                        left: sx0,
+                        top: stripe_y,
+                        right: sx0 + sw,
+                        bottom: stripe_y + stripe_h,
+                    },
+                    rgb(86, 182, 240),
+                );
+                Self::fill(
+                    hdc,
+                    RECT {
+                        left: sx0 + sw + s(1),
+                        top: stripe_y,
+                        right: sx0 + sw * 2 + s(1),
+                        bottom: stripe_y + stripe_h,
+                    },
+                    rgb(236, 72, 153),
+                );
+                Self::fill(
+                    hdc,
+                    RECT {
+                        left: sx0 + sw * 2 + s(2),
+                        top: stripe_y,
+                        right: sx0 + sw * 3 + s(2),
+                        bottom: stripe_y + stripe_h,
+                    },
+                    rgb(245, 197, 24),
+                );
+                Self::fill(
+                    hdc,
+                    RECT {
+                        left: sx0 + sw * 3 + s(3),
+                        top: stripe_y,
+                        right: sx0 + sw * 4 + s(3),
+                        bottom: stripe_y + stripe_h,
+                    },
+                    rgb(168, 85, 247),
+                );
 
                 // Curly code braces
-                unsafe { SelectObject(hdc, self.brand_font); }
-                self.label_mid(hdc, "{ }", icon_rect.left + s(9), (icon_rect.top + icon_rect.bottom) / 2 - s(4), rgb(255, 255, 255), icon_rect);
-                unsafe { SelectObject(hdc, self.ui_font); }
+                unsafe {
+                    SelectObject(hdc, self.brand_font);
+                }
+                self.label_mid(
+                    hdc,
+                    "{ }",
+                    icon_rect.left + s(9),
+                    (icon_rect.top + icon_rect.bottom) / 2 - s(4),
+                    rgb(255, 255, 255),
+                    icon_rect,
+                );
+                unsafe {
+                    SelectObject(hdc, self.ui_font);
+                }
             } else {
                 Self::rounded_fill(hdc, icon_rect, s(6), rgb(14, 28, 54));
                 self.card_outline(hdc, icon_rect, s(6), rgb(35, 70, 125));
-                if !self.icons.draw_generic(hdc, GenericIcon::FolderSrc, icon_rect.left + s(7), icon_rect.top + s(7), s(26)) {
-                    self.draw_vector_folder(hdc, icon_rect.left + s(7), icon_rect.top + s(7), s(26), false);
+                if !self.icons.draw_generic(
+                    hdc,
+                    GenericIcon::FolderSrc,
+                    icon_rect.left + s(7),
+                    icon_rect.top + s(7),
+                    s(26),
+                ) {
+                    self.draw_vector_folder(
+                        hdc,
+                        icon_rect.left + s(7),
+                        icon_rect.top + s(7),
+                        s(26),
+                        false,
+                    );
                 }
             }
 
@@ -1175,10 +1913,21 @@ impl App {
 
             // Row 1: Extension Title & Verified badge & Version
             let display_title = ext.name.split(" - ").next().unwrap_or(&ext.name);
-            unsafe { SelectObject(hdc, self.brand_font); }
-            Self::label(hdc, display_title, content_left, ey + s(6), rgb(245, 247, 250), card_rect);
+            unsafe {
+                SelectObject(hdc, self.brand_font);
+            }
+            Self::label(
+                hdc,
+                display_title,
+                content_left,
+                ey + s(6),
+                rgb(245, 247, 250),
+                card_rect,
+            );
             let title_w = self.text_width(hdc, display_title);
-            unsafe { SelectObject(hdc, self.ui_font); }
+            unsafe {
+                SelectObject(hdc, self.ui_font);
+            }
 
             let badge_x = content_left + title_w + s(5);
             Self::rounded_fill(
@@ -1192,10 +1941,24 @@ impl App {
                 s(3),
                 rgb(56, 189, 248),
             );
-            Self::label(hdc, "✓", badge_x + s(2), ey + s(7), rgb(255, 255, 255), card_rect);
+            Self::label(
+                hdc,
+                "✓",
+                badge_x + s(2),
+                ey + s(7),
+                rgb(255, 255, 255),
+                card_rect,
+            );
 
             let ver_x = badge_x + s(16);
-            Self::label(hdc, &ext.version, ver_x, ey + s(7), rgb(100, 116, 140), card_rect);
+            Self::label(
+                hdc,
+                &ext.version,
+                ver_x,
+                ey + s(7),
+                rgb(100, 116, 140),
+                card_rect,
+            );
 
             // Row 2: Description (clean single-line with ellipsis)
             let desc_clip = RECT {
@@ -1204,17 +1967,31 @@ impl App {
                 right: content_right,
                 bottom: ey + s(46),
             };
-            self.label_ellipsis(hdc, &ext.description, content_left, ey + s(27), rgb(148, 163, 184), desc_clip);
+            self.label_ellipsis(
+                hdc,
+                &ext.description,
+                content_left,
+                ey + s(27),
+                rgb(148, 163, 184),
+                desc_clip,
+            );
 
             // Row 3: Metadata (Publisher, Downloads & Rating) on left
-            let meta_text = format!("by {}   ↓ {}   {}", ext.publisher, ext.downloads, ext.rating);
+            let meta_text = format!("by {}", ext.publisher);
             let meta_clip = RECT {
                 left: content_left,
                 top: ey + s(53),
                 right: card_rect.right - s(86),
                 bottom: ey + s(75),
             };
-            self.label_ellipsis(hdc, &meta_text, content_left, ey + s(53), rgb(100, 116, 145), meta_clip);
+            self.label_ellipsis(
+                hdc,
+                &meta_text,
+                content_left,
+                ey + s(53),
+                rgb(100, 116, 145),
+                meta_clip,
+            );
 
             // Row 3: Action Button on right
             let btn_w = s(76);
@@ -1230,17 +2007,38 @@ impl App {
                 self.panel_card(hdc, btn_rect, s(4), rgb(56, 189, 248), rgb(18, 38, 72));
                 let text_w = self.text_width(hdc, "Checking...");
                 let tx = btn_rect.left + ((btn_rect.right - btn_rect.left) - text_w) / 2;
-                self.label_mid(hdc, "Checking...", tx, (btn_rect.top + btn_rect.bottom) / 2, rgb(186, 230, 253), btn_rect);
+                self.label_mid(
+                    hdc,
+                    "Checking...",
+                    tx,
+                    (btn_rect.top + btn_rect.bottom) / 2,
+                    rgb(186, 230, 253),
+                    btn_rect,
+                );
             } else if ext.installed {
                 self.panel_card(hdc, btn_rect, s(4), rgb(48, 70, 105), rgb(20, 32, 54));
                 let text_w = self.text_width(hdc, "✓ Installed");
                 let tx = btn_rect.left + ((btn_rect.right - btn_rect.left) - text_w) / 2;
-                self.label_mid(hdc, "✓ Installed", tx, (btn_rect.top + btn_rect.bottom) / 2, rgb(148, 195, 245), btn_rect);
+                self.label_mid(
+                    hdc,
+                    "✓ Installed",
+                    tx,
+                    (btn_rect.top + btn_rect.bottom) / 2,
+                    rgb(148, 195, 245),
+                    btn_rect,
+                );
             } else {
                 Self::rounded_fill(hdc, btn_rect, s(4), rgb(14, 99, 156));
                 let text_w = self.text_width(hdc, "Install");
                 let tx = btn_rect.left + ((btn_rect.right - btn_rect.left) - text_w) / 2;
-                self.label_mid(hdc, "Install", tx, (btn_rect.top + btn_rect.bottom) / 2, rgb(255, 255, 255), btn_rect);
+                self.label_mid(
+                    hdc,
+                    "Install",
+                    tx,
+                    (btn_rect.top + btn_rect.bottom) / 2,
+                    rgb(255, 255, 255),
+                    btn_rect,
+                );
             }
 
             ey += card_h + card_gap;
@@ -1259,7 +2057,14 @@ impl App {
             self.panel_card(hdc, guide_rect, s(6), rgb(28, 42, 68), rgb(12, 18, 34));
 
             // Header
-            Self::label(hdc, "WORKFLOW CAPABILITIES", guide_rect.left + s(10), guide_rect.top + s(8), rgb(100, 116, 145), guide_rect);
+            Self::label(
+                hdc,
+                "WORKFLOW CAPABILITIES",
+                guide_rect.left + s(10),
+                guide_rect.top + s(8),
+                rgb(100, 116, 145),
+                guide_rect,
+            );
             Self::fill(
                 hdc,
                 RECT {
@@ -1273,24 +2078,607 @@ impl App {
 
             // Row 1: Prettier
             let r1_y = guide_rect.top + s(32);
-            Self::label(hdc, "{ }", guide_rect.left + s(10), r1_y, rgb(56, 189, 248), guide_rect);
-            Self::label(hdc, "Prettier Formatting", guide_rect.left + s(30), r1_y, rgb(226, 232, 240), guide_rect);
-            Self::label(hdc, "Shift + Alt + F formats active document", guide_rect.left + s(30), r1_y + s(16), rgb(100, 116, 145), guide_rect);
+            Self::label(
+                hdc,
+                "{ }",
+                guide_rect.left + s(10),
+                r1_y,
+                rgb(56, 189, 248),
+                guide_rect,
+            );
+            Self::label(
+                hdc,
+                "Prettier Formatting",
+                guide_rect.left + s(30),
+                r1_y,
+                rgb(226, 232, 240),
+                guide_rect,
+            );
+            Self::label(
+                hdc,
+                "Shift + Alt + F formats active document",
+                guide_rect.left + s(30),
+                r1_y + s(16),
+                rgb(100, 116, 145),
+                guide_rect,
+            );
 
             // Row 2: Material Icons
             let r2_y = r1_y + s(40);
-            if !self.icons.draw_generic(hdc, GenericIcon::FolderSrc, guide_rect.left + s(8), r2_y, s(16)) {
+            if !self.icons.draw_generic(
+                hdc,
+                GenericIcon::FolderSrc,
+                guide_rect.left + s(8),
+                r2_y,
+                s(16),
+            ) {
                 self.draw_vector_folder(hdc, guide_rect.left + s(8), r2_y, s(16), false);
             }
-            Self::label(hdc, "Material Icon Theme", guide_rect.left + s(30), r2_y, rgb(226, 232, 240), guide_rect);
-            Self::label(hdc, "Visual themes for 20+ file types and tabs", guide_rect.left + s(30), r2_y + s(16), rgb(100, 116, 145), guide_rect);
+            Self::label(
+                hdc,
+                "Material Icon Theme",
+                guide_rect.left + s(30),
+                r2_y,
+                rgb(226, 232, 240),
+                guide_rect,
+            );
+            Self::label(
+                hdc,
+                "Visual themes for 20+ file types and tabs",
+                guide_rect.left + s(30),
+                r2_y + s(16),
+                rgb(100, 116, 145),
+                guide_rect,
+            );
 
             // Row 3: Real-Time Engine
             let r3_y = r2_y + s(40);
-            Self::label(hdc, "⚡", guide_rect.left + s(10), r3_y, rgb(245, 197, 24), guide_rect);
-            Self::label(hdc, "Real-Time Node Subprocess", guide_rect.left + s(30), r3_y, rgb(226, 232, 240), guide_rect);
-            Self::label(hdc, "Non-blocking background CLI execution", guide_rect.left + s(30), r3_y + s(16), rgb(100, 116, 145), guide_rect);
+            Self::label(
+                hdc,
+                "⚡",
+                guide_rect.left + s(10),
+                r3_y,
+                rgb(245, 197, 24),
+                guide_rect,
+            );
+            Self::label(
+                hdc,
+                "Real-Time Node Subprocess",
+                guide_rect.left + s(30),
+                r3_y,
+                rgb(226, 232, 240),
+                guide_rect,
+            );
+            Self::label(
+                hdc,
+                "Non-blocking background CLI execution",
+                guide_rect.left + s(30),
+                r3_y + s(16),
+                rgb(100, 116, 145),
+                guide_rect,
+            );
+        }
+    }
+
+    fn paint_extensions_panel(&self, hdc: HDC, left: i32, right: i32, bottom: i32, clip: RECT) {
+        let s = |v: i32| self.scale(v);
+
+        let search = RECT {
+            left: left + s(8),
+            top: s(48),
+            right: right - s(8),
+            bottom: s(84),
+        };
+        self.panel_card(
+            hdc,
+            search,
+            s(5),
+            if self.extensions_search_active {
+                rgb(56, 189, 248)
+            } else {
+                rgb(42, 62, 96)
+            },
+            rgb(13, 22, 39),
+        );
+        let mx = search.left + s(15);
+        let my = (search.top + search.bottom) / 2;
+        self.stroke(
+            hdc,
+            if self.extensions_search_active {
+                rgb(56, 189, 248)
+            } else {
+                rgb(103, 132, 176)
+            },
+            |hdc| unsafe {
+                Ellipse(hdc, mx - s(5), my - s(5), mx + s(5), my + s(5));
+                MoveToEx(hdc, mx + s(4), my + s(4), null_mut());
+                LineTo(hdc, mx + s(8), my + s(8));
+            },
+        );
+        let text_x = search.left + s(31);
+        let text_y = search.top + s(9);
+        let search_clip = RECT {
+            left: text_x,
+            top: search.top,
+            right: search.right - s(32),
+            bottom: search.bottom,
+        };
+        if self.extensions_query.is_empty() {
+            let placeholder = if self.extensions_search_active && self.caret_on {
+                "|"
+            } else {
+                "Search Extensions"
+            };
+            Self::label(
+                hdc,
+                placeholder,
+                text_x,
+                text_y,
+                if self.extensions_search_active {
+                    self.theme.text
+                } else {
+                    self.theme.muted
+                },
+                search_clip,
+            );
+        } else {
+            let value = if self.extensions_search_active && self.caret_on {
+                format!("{}|", self.extensions_query)
+            } else {
+                self.extensions_query.clone()
+            };
+            self.label_ellipsis(hdc, &value, text_x, text_y, self.theme.text, search_clip);
+            self.stroke(hdc, self.theme.muted, |hdc| unsafe {
+                let cx = search.right - s(16);
+                MoveToEx(hdc, cx - s(4), my - s(4), null_mut());
+                LineTo(hdc, cx + s(4), my + s(4));
+                MoveToEx(hdc, cx + s(4), my - s(4), null_mut());
+                LineTo(hdc, cx - s(4), my + s(4));
+            });
+        }
+        // Compact funnel icon; search remains the real filtering mechanism.
+        if self.extensions_query.is_empty() {
+            let fx = search.right - s(20);
+            self.stroke(hdc, rgb(103, 132, 176), |hdc| unsafe {
+                MoveToEx(hdc, fx - s(5), my - s(5), null_mut());
+                LineTo(hdc, fx + s(5), my - s(5));
+                LineTo(hdc, fx + s(1), my);
+                LineTo(hdc, fx + s(1), my + s(5));
+                LineTo(hdc, fx - s(1), my + s(6));
+                LineTo(hdc, fx - s(1), my);
+                LineTo(hdc, fx - s(5), my - s(5));
+            });
+        }
+
+        let tabs = RECT {
+            left: left + s(8),
+            top: s(92),
+            right: right - s(8),
+            bottom: s(122),
+        };
+        self.panel_card(hdc, tabs, s(5), rgb(31, 47, 77), rgb(13, 22, 39));
+        let half = (tabs.right - tabs.left) / 2;
+        let market = RECT {
+            left: tabs.left + s(2),
+            top: tabs.top + s(2),
+            right: tabs.left + half,
+            bottom: tabs.bottom - s(2),
+        };
+        let installed = RECT {
+            left: market.right,
+            top: market.top,
+            right: tabs.right - s(2),
+            bottom: market.bottom,
+        };
+        let selected = if self.extensions_tab == ExtensionsTab::Marketplace {
+            market
+        } else {
+            installed
+        };
+        self.panel_card(hdc, selected, s(4), rgb(56, 189, 248), rgb(27, 57, 103));
+        let tab_label = |app: &App, label: &str, rect: RECT, active: bool| {
+            let width = app.text_width(hdc, label);
+            Self::label(
+                hdc,
+                label,
+                rect.left + (rect.right - rect.left - width) / 2,
+                rect.top + s(5),
+                if active {
+                    rgb(245, 250, 255)
+                } else {
+                    rgb(154, 174, 207)
+                },
+                rect,
+            );
+        };
+        tab_label(
+            self,
+            "Marketplace",
+            market,
+            self.extensions_tab == ExtensionsTab::Marketplace,
+        );
+        let installed_count = self.extensions.iter().filter(|ext| ext.installed).count();
+        let installed_text = format!("Installed  {installed_count}");
+        tab_label(
+            self,
+            &installed_text,
+            installed,
+            self.extensions_tab == ExtensionsTab::Installed,
+        );
+
+        let filter_top = s(132);
+        let mut filter_x = left + s(8);
+        for (filter, label, width) in ExtensionsFilter::PILLS {
+            let rect = RECT {
+                left: filter_x,
+                top: filter_top,
+                right: filter_x + s(width),
+                bottom: filter_top + s(28),
+            };
+            // Filters apply to the curated list, not to search results.
+            let active = self.extensions_filter == filter
+                && self.extensions_tab == ExtensionsTab::Marketplace
+                && self.extensions_query.trim().is_empty();
+            self.panel_card(
+                hdc,
+                rect,
+                s(5),
+                if active {
+                    rgb(56, 189, 248)
+                } else {
+                    rgb(35, 50, 78)
+                },
+                if active {
+                    rgb(26, 55, 98)
+                } else {
+                    rgb(15, 24, 43)
+                },
+            );
+            let label_width = self.text_width(hdc, label);
+            self.label_ellipsis(
+                hdc,
+                label,
+                rect.left + ((rect.right - rect.left - label_width) / 2).max(s(5)),
+                rect.top + s(4),
+                if active {
+                    rgb(235, 246, 255)
+                } else {
+                    rgb(151, 171, 204)
+                },
+                RECT {
+                    left: rect.left + s(4),
+                    top: rect.top,
+                    right: rect.right - s(4),
+                    bottom: rect.bottom,
+                },
+            );
+            filter_x = rect.right + s(4);
+        }
+
+        let visible = self.filtered_extensions();
+        let section_y = s(170);
+        let section_name = if self.extensions_tab == ExtensionsTab::Installed {
+            "INSTALLED"
+        } else {
+            "RECOMMENDED"
+        };
+        Self::label(
+            hdc,
+            section_name,
+            left + s(10),
+            section_y,
+            rgb(156, 181, 220),
+            clip,
+        );
+        let heading_width = self.text_width(hdc, section_name);
+        let count = visible.len().to_string();
+        // Sized to the number: a registry search can match hundreds.
+        let badge_left = left + s(18) + heading_width;
+        let badge_right = badge_left + self.text_width(hdc, &count) + s(18);
+        let badge = RECT {
+            left: badge_left,
+            top: section_y - s(2),
+            right: badge_right,
+            bottom: section_y + s(20),
+        };
+        self.panel_card(hdc, badge, s(10), rgb(47, 68, 105), rgb(24, 39, 67));
+        Self::label(
+            hdc,
+            &count,
+            badge.left + s(9),
+            section_y,
+            rgb(214, 227, 248),
+            badge,
+        );
+
+        let mut y = s(194);
+        let card_h = s(116);
+        let gap = s(8);
+        if visible.is_empty() {
+            let message = if self.extensions_tab == ExtensionsTab::Installed {
+                "No installed extensions".to_string()
+            } else if self.extensions_query.is_empty() {
+                "No recommended extensions available".to_string()
+            } else {
+                format!("No extensions match \"{}\"", self.extensions_query.trim())
+            };
+            self.label_ellipsis(
+                hdc,
+                &message,
+                left + s(12),
+                y + s(10),
+                self.theme.muted,
+                RECT {
+                    left,
+                    top: clip.top,
+                    right: right - s(12),
+                    bottom: clip.bottom,
+                },
+            );
+            return;
+        }
+
+        // As many cards as fit; the click handler in input.rs applies the
+        // same rule, so a card that isn't drawn can't be clicked.
+        for ext in &visible {
+            if y + card_h > bottom {
+                break;
+            }
+            let card = RECT {
+                left: left + s(8),
+                top: y,
+                right: right - s(8),
+                bottom: y + card_h,
+            };
+            self.panel_card(hdc, card, s(6), rgb(35, 52, 84), rgb(15, 25, 44));
+            let icon = RECT {
+                left: card.left + s(10),
+                top: card.top + s(12),
+                right: card.left + s(56),
+                bottom: card.top + s(58),
+            };
+            let content_x = icon.right + s(10);
+            if ext.id == "prettier" {
+                self.panel_card(hdc, icon, s(6), rgb(47, 63, 96), rgb(22, 29, 47));
+                unsafe { SelectObject(hdc, self.brand_font) };
+                Self::label(
+                    hdc,
+                    "{ }",
+                    icon.left + s(10),
+                    icon.top + s(9),
+                    rgb(248, 250, 255),
+                    icon,
+                );
+                unsafe { SelectObject(hdc, self.ui_font) };
+                let colors = [
+                    rgb(86, 182, 240),
+                    rgb(236, 72, 153),
+                    rgb(245, 197, 24),
+                    rgb(168, 85, 247),
+                ];
+                for (index, color) in colors.iter().enumerate() {
+                    Self::fill(
+                        hdc,
+                        RECT {
+                            left: icon.left + s(7 + index as i32 * 8),
+                            top: icon.bottom - s(8),
+                            right: icon.left + s(13 + index as i32 * 8),
+                            bottom: icon.bottom - s(5),
+                        },
+                        *color,
+                    );
+                }
+            } else if ext.id == "dracula" {
+                self.panel_card(hdc, icon, s(6), rgb(70, 55, 112), rgb(30, 24, 55));
+                unsafe {
+                    let brush = CreateSolidBrush(rgb(167, 109, 242));
+                    let old_brush = SelectObject(hdc, brush);
+                    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                    Ellipse(
+                        hdc,
+                        icon.left + s(10),
+                        icon.top + s(9),
+                        icon.right - s(9),
+                        icon.bottom - s(9),
+                    );
+                    SelectObject(hdc, old_pen);
+                    SelectObject(hdc, old_brush);
+                    DeleteObject(brush);
+                }
+            } else {
+                self.panel_card(hdc, icon, s(6), rgb(39, 83, 72), rgb(18, 43, 39));
+                if !self.icons.draw_generic(
+                    hdc,
+                    GenericIcon::FolderSrc,
+                    icon.left + s(9),
+                    icon.top + s(9),
+                    s(28),
+                ) {
+                    self.draw_vector_folder(hdc, icon.left + s(9), icon.top + s(9), s(28), false);
+                }
+            }
+
+            let title = ext.name.split(" - ").next().unwrap_or(&ext.name);
+            unsafe { SelectObject(hdc, self.brand_font) };
+            self.label_ellipsis(
+                hdc,
+                title,
+                content_x,
+                card.top + s(9),
+                rgb(244, 248, 255),
+                RECT {
+                    left: content_x,
+                    top: card.top,
+                    right: card.right - s(70),
+                    bottom: card.bottom,
+                },
+            );
+            unsafe { SelectObject(hdc, self.ui_font) };
+            self.label_ellipsis(
+                hdc,
+                &ext.version,
+                card.right - s(46),
+                card.top + s(9),
+                rgb(130, 151, 184),
+                RECT {
+                    left: card.right - s(46),
+                    top: card.top,
+                    right: card.right - s(8),
+                    bottom: card.bottom,
+                },
+            );
+            self.label_ellipsis(
+                hdc,
+                &ext.description,
+                content_x,
+                card.top + s(36),
+                rgb(167, 186, 216),
+                RECT {
+                    left: content_x,
+                    top: card.top,
+                    right: card.right - s(10),
+                    bottom: card.bottom,
+                },
+            );
+            self.label_ellipsis(
+                hdc,
+                &ext.publisher,
+                content_x,
+                card.top + s(62),
+                rgb(111, 137, 177),
+                RECT {
+                    left: content_x,
+                    top: card.top,
+                    right: card.right - s(10),
+                    bottom: card.bottom,
+                },
+            );
+            self.label_ellipsis(
+                hdc,
+                ext.category().label(),
+                content_x,
+                card.top + s(87),
+                rgb(111, 137, 177),
+                RECT {
+                    left: content_x,
+                    top: card.top,
+                    right: card.right - s(92),
+                    bottom: card.bottom,
+                },
+            );
+            let action = RECT {
+                left: card.right - s(82),
+                top: card.top + s(80),
+                right: card.right - s(10),
+                bottom: card.top + s(106),
+            };
+            if ext.installing {
+                self.panel_card(hdc, action, s(4), rgb(56, 189, 248), rgb(22, 48, 83));
+                Self::label(
+                    hdc,
+                    "Checking...",
+                    action.left + s(8),
+                    action.top + s(4),
+                    rgb(190, 228, 250),
+                    action,
+                );
+            } else if ext.installed {
+                self.panel_card(hdc, action, s(4), rgb(29, 145, 84), rgb(15, 58, 45));
+                Self::label(
+                    hdc,
+                    "\u{2713} Installed",
+                    action.left + s(8),
+                    action.top + s(4),
+                    rgb(202, 250, 220),
+                    action,
+                );
+            } else {
+                Self::rounded_fill(hdc, action, s(4), rgb(15, 116, 177));
+                let width = self.text_width(hdc, "Install");
+                Self::label(
+                    hdc,
+                    "Install",
+                    action.left + (action.right - action.left - width) / 2,
+                    action.top + s(4),
+                    rgb(255, 255, 255),
+                    action,
+                );
+            }
+            y += card_h + gap;
+        }
+
+        let capabilities_top = y + s(8);
+        if capabilities_top + s(104) < bottom {
+            Self::fill(
+                hdc,
+                RECT {
+                    left: left + s(8),
+                    top: capabilities_top,
+                    right: right - s(8),
+                    bottom: capabilities_top + s(1),
+                },
+                rgb(35, 52, 84),
+            );
+            Self::label(
+                hdc,
+                "ACTIVE CAPABILITIES",
+                left + s(10),
+                capabilities_top + s(12),
+                rgb(156, 181, 220),
+                clip,
+            );
+            let prettier_ready = self
+                .extensions
+                .iter()
+                .any(|ext| ext.id == "prettier" && ext.installed);
+            let material_ready = self
+                .extensions
+                .iter()
+                .any(|ext| ext.id == "material-icons" && ext.installed);
+            let rows = [
+                (
+                    "Formatter",
+                    if prettier_ready {
+                        "Prettier ready"
+                    } else {
+                        "Built-in JSON/TOML ready"
+                    },
+                ),
+                (
+                    "Icon Theme",
+                    if material_ready {
+                        "Material Icon Theme active"
+                    } else {
+                        "Built-in icons active"
+                    },
+                ),
+            ];
+            for (index, (name, detail)) in rows.iter().enumerate() {
+                let row_y = capabilities_top + s(38 + index as i32 * 32);
+                unsafe {
+                    let brush = CreateSolidBrush(rgb(42, 204, 113));
+                    let old_brush = SelectObject(hdc, brush);
+                    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                    Ellipse(hdc, left + s(12), row_y + s(5), left + s(19), row_y + s(12));
+                    SelectObject(hdc, old_pen);
+                    SelectObject(hdc, old_brush);
+                    DeleteObject(brush);
+                }
+                Self::label(hdc, name, left + s(27), row_y, self.theme.text, clip);
+                self.label_ellipsis(
+                    hdc,
+                    detail,
+                    left + s(104),
+                    row_y,
+                    self.theme.muted,
+                    RECT {
+                        left,
+                        top: clip.top,
+                        right: right - s(10),
+                        bottom: clip.bottom,
+                    },
+                );
+            }
         }
     }
 }
-

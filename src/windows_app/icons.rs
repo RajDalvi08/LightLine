@@ -57,6 +57,69 @@ pub(super) enum GenericIcon {
     FolderSrc,
 }
 
+// The Run & Debug toolbar's controls, drawn from SVG so their curves and
+// diagonals are anti-aliased like the file icons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum DebugGlyph {
+    Start,
+    Continue,
+    Pause,
+    StepOver,
+    StepInto,
+    StepOut,
+    Restart,
+    Stop,
+    // Editor gutter markers.
+    Breakpoint,
+    ExecutionArrow,
+}
+
+impl DebugGlyph {
+    // 24x24 artwork; `color` is a CSS hex colour such as "#aac8fa".
+    fn svg(self, color: &str) -> String {
+        let line = format!(
+            r#"fill="none" stroke="{color}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round""#
+        );
+        let body = match self {
+            DebugGlyph::Start => format!(
+                r#"<path fill="{color}" d="M8 5.2v13.6a1.1 1.1 0 0 0 1.7.92l10.3-6.8a1.1 1.1 0 0 0 0-1.84L9.7 4.28A1.1 1.1 0 0 0 8 5.2z"/>"#
+            ),
+            DebugGlyph::Continue => format!(
+                r#"<rect fill="{color}" x="4" y="5" width="3" height="14" rx="1.1"/><path fill="{color}" d="M10 6.1v11.8a1 1 0 0 0 1.53.85l9.2-5.9a1 1 0 0 0 0-1.7l-9.2-5.9A1 1 0 0 0 10 6.1z"/>"#
+            ),
+            DebugGlyph::Pause => format!(
+                r#"<rect fill="{color}" x="6" y="5" width="4" height="14" rx="1.2"/><rect fill="{color}" x="14" y="5" width="4" height="14" rx="1.2"/>"#
+            ),
+            // An arc over a statement (the dot), landing past it.
+            DebugGlyph::StepOver => format!(
+                r#"<path {line} d="M5 14a7 7 0 0 1 14 0"/><path {line} d="M15.8 11.2 19 14.4l3.2-3.2"/><circle fill="{color}" cx="12" cy="19" r="2.2"/>"#
+            ),
+            // Down into the statement.
+            DebugGlyph::StepInto => format!(
+                r#"<path {line} d="M12 3.5v10"/><path {line} d="M7.8 9.6 12 13.8l4.2-4.2"/><circle fill="{color}" cx="12" cy="19.5" r="2.2"/>"#
+            ),
+            // Up and out of it.
+            DebugGlyph::StepOut => format!(
+                r#"<path {line} d="M12 13.5V3.8"/><path {line} d="M7.8 8 12 3.8 16.2 8"/><circle fill="{color}" cx="12" cy="19.5" r="2.2"/>"#
+            ),
+            DebugGlyph::Restart => format!(
+                r#"<path {line} d="M21.35 5.2v5.1h-5.1"/><path {line} d="M19.12 14.55a7.65 7.65 0 1 1-1.8-7.96l4.03 3.71"/>"#
+            ),
+            DebugGlyph::Breakpoint => format!(r#"<circle fill="{color}" cx="12" cy="12" r="9"/>"#),
+            // The line execution is paused on, pointing into the code.
+            DebugGlyph::ExecutionArrow => format!(
+                r#"<path fill="{color}" d="M3.5 7.2a1.7 1.7 0 0 1 1.7-1.7h8.6a1.7 1.7 0 0 1 1.25.55l5.1 5.35a.9.9 0 0 1 0 1.2l-5.1 5.35a1.7 1.7 0 0 1-1.25.55H5.2a1.7 1.7 0 0 1-1.7-1.7z"/>"#
+            ),
+            DebugGlyph::Stop => {
+                format!(r#"<rect fill="{color}" x="5.5" y="5.5" width="13" height="13" rx="2.2"/>"#)
+            }
+        };
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">{body}</svg>"#
+        )
+    }
+}
+
 pub(super) struct IconSet {
     // An installed icon-theme extension (e.g. Material Icon Theme), loaded
     // from %APPDATA%\LightLine\extensions\material-icon-theme if installed
@@ -70,6 +133,9 @@ pub(super) struct IconSet {
     // have open), so eagerly converting the rest would be pure waste.
     svg_cache: RefCell<HashMap<PathBuf, HICON>>,
     builtin_cache: RefCell<HashMap<BuiltinIcon, HICON>>,
+    // Keyed by glyph, COLORREF and pixel size: the toolbar redraws the same
+    // few combinations (enabled, disabled, stop red) on every paint.
+    glyph_cache: RefCell<HashMap<(DebugGlyph, u32, i32), HICON>>,
 }
 
 impl IconSet {
@@ -83,7 +149,39 @@ impl IconSet {
             size,
             svg_cache: RefCell::new(HashMap::new()),
             builtin_cache: RefCell::new(HashMap::new()),
+            glyph_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    // Draws `glyph` in `color` (a COLORREF) as a `size`-pixel square at (x, y).
+    pub(super) fn draw_glyph(
+        &self,
+        hdc: HDC,
+        glyph: DebugGlyph,
+        color: u32,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) -> bool {
+        let key = (glyph, color, size);
+        let cached = self.glyph_cache.borrow().get(&key).copied();
+        let icon = match cached {
+            Some(icon) => icon,
+            None => {
+                let hex = format!(
+                    "#{:02x}{:02x}{:02x}",
+                    color & 0xff,
+                    (color >> 8) & 0xff,
+                    (color >> 16) & 0xff
+                );
+                let Some(icon) = Self::svg_to_hicon(hdc, glyph.svg(&hex).as_bytes(), size) else {
+                    return false;
+                };
+                self.glyph_cache.borrow_mut().insert(key, icon);
+                icon
+            }
+        };
+        unsafe { DrawIconEx(hdc, x, y, icon, size, size, 0, null_mut(), DI_NORMAL) != 0 }
     }
 
     // Draws the icon for `path` (or, for a folder, `is_dir`/`expanded`) at
@@ -102,10 +200,10 @@ impl IconSet {
         y: i32,
         size: i32,
     ) -> bool {
-        if use_theme
-            && let Some(icon) = self.themed_icon(hdc, path, is_dir, expanded)
-        {
-            return unsafe { DrawIconEx(hdc, x, y, icon, size, size, 0, null_mut(), DI_NORMAL) != 0 };
+        if use_theme && let Some(icon) = self.themed_icon(hdc, path, is_dir, expanded) {
+            return unsafe {
+                DrawIconEx(hdc, x, y, icon, size, size, 0, null_mut(), DI_NORMAL) != 0
+            };
         }
         let builtin = BuiltinIcon::resolve_for_path(path, is_dir, expanded);
         self.draw_builtin(hdc, builtin, x, y, size)
@@ -114,7 +212,14 @@ impl IconSet {
     // Draws a plain file/folder glyph that isn't resolved from any
     // particular name -- the welcome screen's "Open Folder" icon, the
     // explorer's workspace-root row, the Extensions panel's icon badges.
-    pub(super) fn draw_generic(&self, hdc: HDC, kind: GenericIcon, x: i32, y: i32, size: i32) -> bool {
+    pub(super) fn draw_generic(
+        &self,
+        hdc: HDC,
+        kind: GenericIcon,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) -> bool {
         if let Some(theme) = self.theme.as_ref() {
             let svg_path = match kind {
                 GenericIcon::File => theme.generic_file_icon(),
@@ -123,7 +228,9 @@ impl IconSet {
                 GenericIcon::FolderSrc => theme.resolve_directory("src", false),
             };
             if let Some(icon) = svg_path.and_then(|path| self.cached_icon(hdc, path)) {
-                return unsafe { DrawIconEx(hdc, x, y, icon, size, size, 0, null_mut(), DI_NORMAL) != 0 };
+                return unsafe {
+                    DrawIconEx(hdc, x, y, icon, size, size, 0, null_mut(), DI_NORMAL) != 0
+                };
             }
         }
         let builtin = match kind {
@@ -135,7 +242,14 @@ impl IconSet {
         self.draw_builtin(hdc, builtin, x, y, size)
     }
 
-    pub(super) fn draw_builtin(&self, hdc: HDC, kind: BuiltinIcon, x: i32, y: i32, size: i32) -> bool {
+    pub(super) fn draw_builtin(
+        &self,
+        hdc: HDC,
+        kind: BuiltinIcon,
+        x: i32,
+        y: i32,
+        size: i32,
+    ) -> bool {
         let Some(icon) = self.cached_builtin(hdc, kind) else {
             return false;
         };
@@ -289,12 +403,40 @@ impl Drop for IconSet {
                 unsafe { DestroyIcon(*icon) };
             }
         }
+        for icon in self.glyph_cache.borrow().values() {
+            if !icon.is_null() {
+                unsafe { DestroyIcon(*icon) };
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod icon_tests {
     use super::*;
+
+    #[test]
+    fn every_debug_glyph_is_valid_svg() {
+        let glyphs = [
+            DebugGlyph::Start,
+            DebugGlyph::Continue,
+            DebugGlyph::Pause,
+            DebugGlyph::StepOver,
+            DebugGlyph::StepInto,
+            DebugGlyph::StepOut,
+            DebugGlyph::Restart,
+            DebugGlyph::Stop,
+            DebugGlyph::Breakpoint,
+            DebugGlyph::ExecutionArrow,
+        ];
+        for glyph in glyphs {
+            let svg = glyph.svg("#aac8fa");
+            let tree = usvg::Tree::from_data(svg.as_bytes(), &usvg::Options::default());
+            assert!(tree.is_ok(), "{glyph:?} does not parse: {svg}");
+            let drawn = tree.unwrap().root().has_children();
+            assert!(drawn, "{glyph:?} draws nothing");
+        }
+    }
 
     #[test]
     fn all_builtin_icons_rasterize_cleanly() {
@@ -323,7 +465,10 @@ mod icon_tests {
         for icon_kind in all_icons {
             let svg = icon_kind.svg_str();
             let icon = IconSet::svg_to_hicon(hdc, svg.as_bytes(), 18);
-            assert!(icon.is_some(), "failed to rasterize builtin icon {icon_kind:?}");
+            assert!(
+                icon.is_some(),
+                "failed to rasterize builtin icon {icon_kind:?}"
+            );
             let icon = icon.unwrap();
             assert!(!icon.is_null());
             unsafe { DestroyIcon(icon) };

@@ -1,6 +1,16 @@
 use super::super::*;
 use super::*;
 
+// `amount` (0..=1) of `over` mixed into `base`; both are COLORREFs.
+fn blend(base: u32, over: u32, amount: f32) -> u32 {
+    let channel = |shift: u32| {
+        let from = ((base >> shift) & 0xff) as f32;
+        let to = ((over >> shift) & 0xff) as f32;
+        ((from + (to - from) * amount).round() as u32) << shift
+    };
+    channel(0) | channel(8) | channel(16)
+}
+
 impl App {
     pub(in crate::windows_app) fn paint_code_pane(
         &self,
@@ -49,9 +59,24 @@ impl App {
             let guide_brush = CreateSolidBrush(self.theme.edge);
             let git_added_brush = CreateSolidBrush(self.theme.green);
             let git_mod_brush = CreateSolidBrush(self.theme.blue);
+            let git_del_brush = CreateSolidBrush(self.theme.error);
             let git_diff = doc.path.as_ref().and_then(|p| self.git_diff_cache.get(p));
+            // The line a paused debug session stopped on in this file, marked
+            // like VS Code: a yellow arrow in the breakpoint column and a
+            // tinted line.
+            let paused_line = if self.debug_paused() {
+                self.debug_state.frames.first().and_then(|frame| {
+                    let same_file = Self::same_path(frame.path.as_deref()?, doc.path.as_deref()?);
+                    same_file.then(|| frame.line.saturating_sub(1) as usize)
+                })
+            } else {
+                None
+            };
+            let paused_bg = blend(self.theme.editor_bg, rgb(255, 204, 0), 0.14);
             for row in 0..visible {
-                let index = view.first_line + row;
+                let Some(index) = doc.visual_row_to_doc_line(view.first_line, row) else {
+                    break;
+                };
                 if index >= doc.line_count() {
                     break;
                 }
@@ -59,7 +84,13 @@ impl App {
                 if y >= bottom {
                     break;
                 }
-                if index == view.cursor.line {
+                let paused_here = paused_line == Some(index);
+                if paused_here || index == view.cursor.line {
+                    let line_bg = if paused_here {
+                        paused_bg
+                    } else {
+                        self.theme.line_bg
+                    };
                     Self::fill(
                         hdc,
                         RECT {
@@ -68,24 +99,8 @@ impl App {
                             right,
                             bottom: (y + self.line_height).min(bottom),
                         },
-                        self.theme.line_bg,
+                        line_bg,
                     );
-                }
-                if doc.has_breakpoint(index) {
-                    let dot_brush = CreateSolidBrush(rgb(220, 60, 60));
-                    let old_brush = SelectObject(hdc, dot_brush);
-                    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-                    let dot_top = y + (self.line_height - self.scale(9)) / 2;
-                    Ellipse(
-                        hdc,
-                        left + self.scale(6),
-                        dot_top,
-                        left + self.scale(6) + self.scale(9),
-                        dot_top + self.scale(9),
-                    );
-                    SelectObject(hdc, old_pen);
-                    SelectObject(hdc, old_brush);
-                    DeleteObject(dot_brush);
                 }
                 let number = format!("{}", index + 1);
                 let num: Vec<u16> = number.encode_utf16().collect();
@@ -97,15 +112,18 @@ impl App {
                         self.theme.line_number
                     },
                 );
+                // Right-aligned against the fold column, leaving the left of
+                // the gutter free for the breakpoint marker.
+                let number_right = left + self.scale(GUTTER) - self.scale(18);
                 let number_clip = RECT {
                     left,
                     top: y,
-                    right: left + self.scale(GUTTER),
+                    right: number_right,
                     bottom,
                 };
                 ExtTextOutW(
                     hdc,
-                    left + self.scale(12),
+                    number_right - self.text_width(hdc, &number),
                     y,
                     ETO_CLIPPED,
                     &number_clip,
@@ -113,9 +131,41 @@ impl App {
                     num.len() as u32,
                     null(),
                 );
-                if let Some((added, modified)) = git_diff {
+                // Breakpoint dot; on the paused line a yellow arrow instead,
+                // carrying a small dot when that line also has a breakpoint.
+                let marker_x = left + self.scale(10);
+                let marker_y = y + self.line_height / 2;
+                let red = rgb(232, 72, 76);
+                let marker = |glyph: DebugGlyph, color: u32, size: i32, shift: i32| {
+                    let (x, y) = (marker_x + shift - size / 2, marker_y - size / 2);
+                    self.icons.draw_glyph(hdc, glyph, color, x, y, size);
+                };
+                if paused_here {
+                    let yellow = rgb(255, 204, 0);
+                    marker(DebugGlyph::ExecutionArrow, yellow, self.scale(18), 0);
+                    if doc.has_breakpoint(index) {
+                        marker(DebugGlyph::Breakpoint, red, self.scale(9), -self.scale(1));
+                    }
+                } else if doc.has_breakpoint(index) {
+                    marker(DebugGlyph::Breakpoint, red, self.scale(14), 0);
+                }
+                // Code folding chevron in gutter column
+                let is_folded = doc.is_folded_start(index).is_some();
+                let is_foldable = is_folded || doc.foldable_range(index).is_some();
+                if is_foldable {
+                    // Drawn as vector strokes, like the Explorer's chevrons:
+                    // the editor font may have no glyph for ⌄ or ›, which
+                    // rendered as an empty box.
+                    self.chevron(
+                        hdc,
+                        left + self.scale(GUTTER) - self.scale(10),
+                        y + self.line_height / 2,
+                        !is_folded,
+                    );
+                }
+                if let Some(diff) = git_diff {
                     let gutter_edge = left + self.scale(GUTTER) - self.scale(3);
-                    if added.contains(&index) {
+                    if diff.added.contains(&index) {
                         FillRect(
                             hdc,
                             &RECT {
@@ -126,7 +176,7 @@ impl App {
                             },
                             git_added_brush,
                         );
-                    } else if modified.contains(&index) {
+                    } else if diff.modified.contains(&index) {
                         FillRect(
                             hdc,
                             &RECT {
@@ -137,6 +187,24 @@ impl App {
                             },
                             git_mod_brush,
                         );
+                    }
+                    if diff.deleted.contains(&index) {
+                        let pts = [
+                            POINT { x: gutter_edge, y },
+                            POINT {
+                                x: gutter_edge + self.scale(3),
+                                y: y + self.scale(3),
+                            },
+                            POINT {
+                                x: gutter_edge,
+                                y: y + self.scale(6),
+                            },
+                        ];
+                        let old_brush = SelectObject(hdc, git_del_brush);
+                        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+                        Polygon(hdc, pts.as_ptr(), 3);
+                        SelectObject(hdc, old_pen);
+                        SelectObject(hdc, old_brush);
                     }
                 }
                 let source = doc.line(index);
@@ -210,6 +278,37 @@ impl App {
                     chars.len() as u32,
                     null(),
                 );
+                if doc.is_folded_start(index).is_some() {
+                    let text_w = self.text_width(hdc, &line);
+                    let pill_x = code_left + text_w + self.scale(6);
+                    let pill_w = self.scale(22);
+                    let pill_h = self.scale(13);
+                    let pill_y = y + (self.line_height - pill_h) / 2;
+                    let pill_bg = CreateSolidBrush(self.theme.active_bg);
+                    FillRect(
+                        hdc,
+                        &RECT {
+                            left: pill_x,
+                            top: pill_y,
+                            right: pill_x + pill_w,
+                            bottom: pill_y + pill_h,
+                        },
+                        pill_bg,
+                    );
+                    DeleteObject(pill_bg);
+                    SetTextColor(hdc, self.theme.line_number_active);
+                    let dots: Vec<u16> = "...".encode_utf16().collect();
+                    ExtTextOutW(
+                        hdc,
+                        pill_x + self.scale(3),
+                        pill_y - self.scale(1),
+                        0,
+                        null(),
+                        dots.as_ptr(),
+                        dots.len() as u32,
+                        null(),
+                    );
+                }
                 if source.len() <= 16_384
                     && let Some(syntax) = &tab.syntax
                 {
@@ -231,7 +330,8 @@ impl App {
                             Color::Attribute => self.theme.attribute,
                         };
                         SetTextColor(hdc, color);
-                        let left = code_left + self.text_width(hdc, safe_slice_prefix(source, span.start));
+                        let left =
+                            code_left + self.text_width(hdc, safe_slice_prefix(source, span.start));
                         let text = safe_slice_range(source, span.start, span.end)
                             .replace('\t', &" ".repeat(self.settings.tab_size));
                         let chars: Vec<u16> = text.encode_utf16().collect();
@@ -264,8 +364,10 @@ impl App {
                     } else {
                         source.len()
                     };
-                    let x1 = code_left + self.text_width(hdc, safe_slice_prefix(source, start_byte));
-                    let x2 = code_left + self.text_width(hdc, safe_slice_prefix(source, end_byte.max(start_byte)));
+                    let x1 =
+                        code_left + self.text_width(hdc, safe_slice_prefix(source, start_byte));
+                    let x2 = code_left
+                        + self.text_width(hdc, safe_slice_prefix(source, end_byte.max(start_byte)));
                     Self::fill(
                         hdc,
                         RECT {
@@ -293,6 +395,7 @@ impl App {
             DeleteObject(guide_brush);
             DeleteObject(git_added_brush);
             DeleteObject(git_mod_brush);
+            DeleteObject(git_del_brush);
             // Bracket matching: highlight the matching bracket pair.
             if pane == self.focused_pane && !self.terminal_focus {
                 let match_brush = CreateSolidBrush(rgb(60, 80, 120));
@@ -339,17 +442,24 @@ impl App {
                     if forward {
                         let mut scan_line = cursor_line;
                         let mut scan_start = byte;
-                        'outer_fwd: while scan_line < doc.line_count() && scan_line < cursor_line + 500 {
+                        'outer_fwd: while scan_line < doc.line_count()
+                            && scan_line < cursor_line + 500
+                        {
                             let text = doc.line(scan_line);
-                            let scan_text = if scan_start < text.len() && text.is_char_boundary(scan_start) {
-                                &text[scan_start..]
-                            } else {
-                                ""
-                            };
+                            let scan_text =
+                                if scan_start < text.len() && text.is_char_boundary(scan_start) {
+                                    &text[scan_start..]
+                                } else {
+                                    ""
+                                };
                             for (i, c) in scan_text.char_indices() {
                                 let abs = scan_start + i;
-                                if c == open { depth += 1; }
-                                if c == close { depth -= 1; }
+                                if c == open {
+                                    depth += 1;
+                                }
+                                if c == close {
+                                    depth -= 1;
+                                }
                                 if depth == 0 {
                                     match_pos = Some((scan_line, abs));
                                     break 'outer_fwd;
@@ -368,34 +478,60 @@ impl App {
                             let bwd_text = safe_slice_prefix(text, end);
                             let indices: Vec<(usize, char)> = bwd_text.char_indices().collect();
                             for &(i, c) in indices.iter().rev() {
-                                if c == close { depth += 1; }
-                                if c == open { depth -= 1; }
+                                if c == close {
+                                    depth += 1;
+                                }
+                                if c == open {
+                                    depth -= 1;
+                                }
                                 if depth == 0 {
                                     match_pos = Some((scan_line, i));
                                     break 'outer_bwd;
                                 }
                             }
-                            if scan_line == 0 || cursor_line - scan_line > 500 { break; }
+                            if scan_line == 0 || cursor_line - scan_line > 500 {
+                                break;
+                            }
                             scan_line -= 1;
                         }
                     }
                     // Draw the highlight rectangles for both brackets.
                     let draw_bracket_bg = |line_idx: usize, b: usize| {
-                        if line_idx < view.first_line { return; }
-                        let row = line_idx - view.first_line;
+                        if doc.is_line_hidden(line_idx) {
+                            return;
+                        }
+                        let Some(row) = doc.visual_row_of(view.first_line, line_idx, visible)
+                        else {
+                            return;
+                        };
                         let y = self.editor_top() + row as i32 * self.line_height;
-                        if y >= bottom { return; }
+                        if y >= bottom {
+                            return;
+                        }
                         let text = doc.line(line_idx);
                         let x = code_left + self.text_width(hdc, safe_slice_prefix(text, b));
-                        let rest = if b < text.len() && text.is_char_boundary(b) { &text[b..] } else { "" };
-                        let ch_text = rest.chars().next().map(|c| &rest[..c.len_utf8()]).unwrap_or(" ");
+                        let rest = if b < text.len() && text.is_char_boundary(b) {
+                            &text[b..]
+                        } else {
+                            ""
+                        };
+                        let ch_text = rest
+                            .chars()
+                            .next()
+                            .map(|c| &rest[..c.len_utf8()])
+                            .unwrap_or(" ");
                         let w = self.text_width(hdc, ch_text);
                         if x < right {
-                            FillRect(hdc, &RECT {
-                                left: x, top: y,
-                                right: (x + w).min(right),
-                                bottom: (y + self.line_height).min(bottom),
-                            }, match_brush);
+                            FillRect(
+                                hdc,
+                                &RECT {
+                                    left: x,
+                                    top: y,
+                                    right: (x + w).min(right),
+                                    bottom: (y + self.line_height).min(bottom),
+                                },
+                                match_brush,
+                            );
                             // The fill above paints over the bracket glyph
                             // that the earlier syntax-color pass already
                             // drew, leaving a blank highlighted box instead
@@ -420,11 +556,16 @@ impl App {
                 && pane == self.focused_pane
             {
                 let line = doc.line(view.cursor.line);
-                let x =
-                    code_left + self.text_width(hdc, safe_slice_prefix(line, view.cursor.byte));
-                let y = self.editor_top()
-                    + (view.cursor.line as i64 - view.first_line as i64) as i32 * self.line_height;
-                if y >= self.editor_top() && y < bottom && x < right {
+                let x = code_left + self.text_width(hdc, safe_slice_prefix(line, view.cursor.byte));
+                // Visual row, not document line: folded blocks above the
+                // caret take one row each.
+                let row = (!doc.is_line_hidden(view.cursor.line))
+                    .then(|| doc.visual_row_of(view.first_line, view.cursor.line, visible))
+                    .flatten();
+                let y = row.map_or(bottom, |row| {
+                    self.editor_top() + row as i32 * self.line_height
+                });
+                if y < bottom && x < right {
                     let caret = CreateSolidBrush(self.theme.cursor);
                     FillRect(
                         hdc,

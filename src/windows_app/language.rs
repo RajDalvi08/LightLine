@@ -324,9 +324,18 @@ impl App {
                     let byte = {
                         let doc = self.doc();
                         let line = line.min(doc.line_count().saturating_sub(1));
-                        (line, lsp::utf16_to_byte(doc.line(line), location.range.start.character))
+                        (
+                            line,
+                            lsp::utf16_to_byte(doc.line(line), location.range.start.character),
+                        )
                     };
-                    self.move_cursor(Pos { line: byte.0, byte: byte.1 }, false);
+                    self.move_cursor(
+                        Pos {
+                            line: byte.0,
+                            byte: byte.1,
+                        },
+                        false,
+                    );
                     self.keep_cursor_visible(hwnd);
                     self.status = format!("Jumped to definition (line {})", byte.0 + 1);
                 }
@@ -364,7 +373,8 @@ impl App {
                             let text = std::fs::read_to_string(&path).ok()?;
                             let line_number = location.range.start.line as usize;
                             let line_text = text.lines().nth(line_number).unwrap_or("");
-                            let byte = lsp::utf16_to_byte(line_text, location.range.start.character);
+                            let byte =
+                                lsp::utf16_to_byte(line_text, location.range.start.character);
                             Some(SearchHit {
                                 path,
                                 line: line_number,
@@ -446,9 +456,7 @@ impl App {
                             )
                         })
                         .collect();
-                    resolved.sort_by(|a, b| {
-                        (b.0.line, b.0.byte).cmp(&(a.0.line, a.0.byte))
-                    });
+                    resolved.sort_by_key(|edit| std::cmp::Reverse((edit.0.line, edit.0.byte)));
                     for (start, end, text) in resolved {
                         let text = text.replace("\r\n", "\n").replace('\r', "\n");
                         self.replace_range(start, end, &text);
@@ -828,8 +836,15 @@ impl App {
         let tx = self.worker_tx.clone();
         self.worker_started(hwnd);
         std::thread::spawn(move || {
-            let result = formatter.format(&code, &path).map_err(|error| error.to_string());
-            let _ = tx.send(WorkerMessage::Formatted(path, formatter.name(), serial, result));
+            let result = formatter
+                .format(&code, &path)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(WorkerMessage::Formatted(
+                path,
+                formatter.name(),
+                serial,
+                result,
+            ));
         });
         self.refresh(hwnd);
     }
@@ -841,12 +856,15 @@ impl App {
     // than hanging it; a failure here doesn't block the save; the file just
     // saves unformatted, same as if the setting were off.
     pub(super) fn apply_format_on_save(&mut self, path: &Path) {
-        if !self.settings.format_on_save || !self.has_extension("prettier") {
+        if !self.settings.format_on_save {
             return;
         }
         let Some(formatter) = lightline::formatter::formatter_for(path) else {
             return;
         };
+        if !formatter.is_builtin() && !self.has_extension("prettier") {
+            return;
+        }
         let code = self.doc().text();
         if code.trim().is_empty() {
             return;
@@ -879,12 +897,15 @@ impl App {
         // (rustfmt, black, clang-format) is picked up automatically, with
         // nothing to keep in sync in this file.
         if let Some(path) = path.as_deref()
-            && lightline::formatter::formatter_for(path).is_some()
+            && let Some(formatter) = lightline::formatter::formatter_for(path)
         {
-            if self.has_extension("prettier") {
+            // Built-in formatters (JSON, TOML) need nothing installed; only
+            // the external ones depend on the Prettier extension.
+            if formatter.is_builtin() || self.has_extension("prettier") {
                 self.format_with_external_formatter(hwnd);
             } else {
-                self.status = "Install Prettier extension to format this file (Ctrl+Shift+X)".into();
+                self.status =
+                    "Install Prettier extension to format this file (Ctrl+Shift+X)".into();
                 self.refresh(hwnd);
             }
             return;
@@ -1036,8 +1057,7 @@ impl App {
         let (start, end) = match (item.edit_start, item.edit_end) {
             (Some(s), Some(e)) => {
                 let doc = self.doc();
-                let start_line =
-                    (s.line as usize).min(doc.line_count().saturating_sub(1));
+                let start_line = (s.line as usize).min(doc.line_count().saturating_sub(1));
                 let end_line = (e.line as usize).min(doc.line_count().saturating_sub(1));
                 (
                     Pos {

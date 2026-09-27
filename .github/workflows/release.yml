@@ -56,14 +56,31 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0
+          # dtolnay/rust-toolchain only installs what's listed here; unlike
+          # the windows-latest image's preinstalled default toolchain (what
+          # rust.yml's build relies on), this pinned 1.98.0 install has
+          # neither by default, and this workflow needs both below.
+          components: rustfmt, clippy
 
       - name: Verify release tag is unused
         shell: pwsh
         env:
           VERSION: ${{ needs.release-request.outputs.version }}
         run: |
+          # Deliberately not "--exit-code": that flag makes git exit 2 (not
+          # 0) precisely when the tag is *absent*, and PowerShell 7.3+'s
+          # default of auto-throwing on any non-zero native-command exit
+          # code turns that ordinary "not found" result into a step
+          # failure. Without the flag, ls-remote always exits 0 and we can
+          # tell whether the tag exists from its output alone.
           $tag = "v$env:VERSION"
-          if (git ls-remote --exit-code --tags origin "refs/tags/$tag") {
+          $existing = git ls-remote --tags origin "refs/tags/$tag" 2>&1
+          Write-Host "git ls-remote exit code: $LASTEXITCODE"
+          Write-Host "git ls-remote output: $existing"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check for existing tag $tag (git ls-remote exited with code $LASTEXITCODE): $existing"
+          }
+          if ($existing) {
             throw "Release tag $tag already exists."
           }
 

@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-09-26
+
+### 2026-09-26
+
+#### Added
+- **Python Debugging (debugpy)**: The Run & Debug panel now debugs the active Python file as **Python: Current File**, through `debugpy` over DAP, alongside **Rust: Current Workspace** (LLDB).
+  - Uses the same interpreter as Run Python File (the selected one, a nearby `.venv`, or `python` on `PATH`). If it lacks `debugpy`, the panel says so and the command palette's **Python: Install debugpy** installs it in the Output tab.
+  - The program runs in the Output tab (debugpy's `runInTerminal`), so `input()` and prints work as in a normal run; `F5`, `F10` and `F11` still drive the debugger while it has focus.
+  - Breakpoints, Locals/Globals with expandable values, call stack, Step Over/In/Out, Pause/Continue, Restart and Stop all work, and an uncaught exception pauses where it was raised instead of ending the program.
+  - Restart relaunches the file the session started with, even if another tab is active by then.
+  - Programs that start other Python processes run normally; those child processes are not debugged.
+- **Launch Configuration Dropdown**: The configuration selector is a real dropdown: **Automatic** follows the active file (`.py` → Python, `.rs` or a Cargo workspace → Rust), or Rust/Python can be pinned. Files neither debugger handles show "No configuration" / "Nothing to debug". Also available as **Debug: Select Configuration** in the command palette.
+- **F9 Toggles a Breakpoint** on the cursor line, as in VS Code.
+
+#### Changed
+- **Sharper Debug Toolbar Icons**: Start, Continue, Pause, Step Over, Step Into, Step Out, Restart and Stop are now anti-aliased SVG glyphs, cached per colour and size, instead of jagged GDI lines. Step Over/Into/Out use the familiar arrow-and-statement-dot shapes and Restart is a proper circular arrow, so each control reads at a glance.
+- **Clearer Gutter Breakpoints and Paused Line**: Breakpoints are now smooth red dots in their own column at the left of the gutter, and line numbers are right-aligned (as in VS Code), so a dot no longer sits on top of the line number. While a debug session is paused, its line gets a yellow arrow in that column (with a small red dot when the line also has a breakpoint) and a faint yellow highlight.
+- **Run & Debug Panel Redesign**: Reworked the native debugger sidebar around a real launch configuration selector (Rust or Python), a prominent Start action, a session-status card, count badges, and collapsible Variables/Call Stack/Breakpoints sections. Pause/Continue, Step Over/In/Out, Restart and Stop controls now appear only while a debug session exists, removing the confusing duplicate disabled toolbar from the idle state. Restart waits for the previous adapter to shut down and drains its queued events so stale termination messages cannot cancel the new session.
+- **Debugger Scope Is Now Documented Accurately**: The DAP debugger targets Rust workspaces through `lldb-dap` and Python files through `debugpy`. C/C++ files can be run with `Ctrl+Shift+R` but have no debugging adapter yet; the README and shortcut descriptions say so.
+- **Extensions Marketplace Redesign**: Rebuilt the native Extensions sidebar with a larger search field, Marketplace/Installed tabs, Featured/Themes/Formatters filters for the curated extensions, a recommended-count heading, richer cards for Prettier, Material Icon Theme and Dracula, and a compact Active Capabilities summary. The panel shows as many cards as fit, so registry search results past the first three are visible, install/installed buttons keep their real behavior, registry versions refresh in place, and capability rows report the formatter and icon theme that are actually active.
+
+#### Fixed
+- **Settings Needed a Restart**: `settings.json` was read only at startup, so saving a change such as `"formatOnSave": true` from inside LightLine did nothing until the next launch. Saving the file now re-reads and applies it immediately ("Settings saved and applied").
+- **Broken `settings.json` Was Silently Ignored**: A syntax error (e.g. a trailing comma) made LightLine quietly fall back to every default. The error is now shown in red in the status bar, on startup and on save, and the settings already in effect are kept.
+- **Command Palette Showed Only 7 Commands**: The Quick Open list was cut off at seven rows, so commands further down, like `Open Settings (JSON)`, could not be reached without typing a filter. The list now scrolls with `Up`/`Down`, `Page Up`/`Page Down` and the mouse wheel, shows a position hint such as `8–14 of 36`, and file results go up to 50 instead of 8. Clicking the hint line no longer opens a hidden eighth result.
+- **Ctrl+P and Ctrl+, Went to the Shell**: With the terminal focused, as it is right after launch, `Ctrl+P` and `Ctrl+,` were sent to the shell instead of opening Quick Open or the settings. Both are now kept for LightLine, like `Ctrl+Shift+P`.
+- **Every Save Reloaded the File**: The file watcher treated LightLine's own save as an outside change and reloaded the document, which wiped its undo history (`Ctrl+Z` could not go back past a save, so format-on-save could not be undone) and replaced the save's status message with "Reloaded: ...". Changes whose modification time and size match LightLine's own last save are now ignored; edits from other programs still reload.
+- **Stepping Targeted the Wrong Thread**: After a stop had been reported, Step Over/In/Out, Continue and Pause were always sent for thread 1 rather than the thread that stopped, so stepping failed whenever that thread's ID was not 1 (lldb-dap uses OS thread IDs). They now follow the thread of the last stop.
+- **Stopping at a Breakpoint Left Run & Debug**: Opening the stopped file switched the sidebar to the Explorer, hiding the variables and call stack. The panel now stays on Run & Debug, and a session that is still launching shows "Starting…" instead of "Paused".
+- **Extension Cards Showed Invented Numbers**: Cards listed download counts and star ratings that were typed into the code (VS Code Marketplace-style figures, not data from the Zed registry, which has none), and every card carried a "verified" check mark. They now show only real data (publisher, registry version) and what kind of extension it is. Registry search results no longer claim only icon themes are supported; color themes are too.
+- **Crash When an Open File Shrank on Disk**: Reloading a file that another program had made shorter left the cursor past the new end, and the next repaint panicked (index out of bounds). Cursors, selections and scroll positions are now kept inside the reloaded text.
+
+### 2026-09-25
+
+#### Added
+- **Terminal Shell Picker & Multi-Profile Support**: Built-in support for launching multiple interactive shells: **PowerShell** (`pwsh`/`powershell`), **Command Prompt** (`cmd.exe`), **Git Bash** (`bash.exe`), and **WSL** (`wsl.exe`).
+  - Added a dropdown button (`⌄`) right next to the terminal `+` button, and right-click support on the `+` button, opening a native popup menu to select and launch any installed shell.
+  - Added "Select Default Profile" menu and `terminalDefaultProfile` configuration in `%APPDATA%\LightLine\settings.json`.
+  - Terminal tab headers show the shell profile (e.g. `PWSH`, `CMD`, `BASH`, `WSL`), numbered (`PWSH 1`, `CMD 2`) when more than one terminal is open.
+  - WSL is offered only when a Linux distribution is installed, not merely when `wsl.exe` exists; Docker Desktop's internal `docker-desktop` distributions don't count.
+  - Choosing an unavailable shell (e.g. from the command palette) shows why in the status bar instead of opening a dead tab, and a default profile that has become unavailable falls back to PowerShell.
+- **Built-in JSON & TOML Formatters**: `.json` and `.toml` files are formatted without Prettier or any other tool installed, via `Shift+Alt+F` (Format Document) and `formatOnSave`.
+  - Both formatters only change layout. JSON keeps key order, number spelling and `//`/`/* */` comments (JSONC such as `tsconfig.json`); TOML keeps comments, key order and multi-line strings.
+  - The TOML result is re-parsed and compared with the original, and formatting is refused if the document would change.
+- **Inline Git Gutter Indicators**: Change markers in the editor gutter comparing the unsaved buffer against Git `HEAD`.
+  - Line diff uses Myers' algorithm after trimming the common prefix and suffix. It runs on a background thread once typing pauses, with a work budget per recompute (live marks are skipped above 50,000 lines), so typing never waits on it.
+  - Each changed region is classified on its own: 🟢 green bar for added lines, 🔵 blue bar for modified lines, 🔴 red marker below a deletion. Unchanged lines between edits stay unmarked.
+  - Updates on keystrokes, undo (`Ctrl+Z`) and redo (`Ctrl+Y`); existing marks move with inserted or deleted lines immediately, before the recompute lands.
+  - Refreshes when `HEAD` moves: a commit or checkout from LightLine, from an outside tool, or from the built-in terminal (LightLine watches `.git/index` and `.git/HEAD`; its own Git reads run with `GIT_OPTIONAL_LOCKS=0` so they never trigger that watch).
+  - Only files inside a Git repository get markers; new files not yet in `HEAD` are shown as added.
+- **Code Folding**: Fold blocks by brackets (`{ }`, `[ ]`, `( )`) or indentation (e.g. Python `def`/`class` blocks). Indentation folding applies only outside bracket languages, so a wrapped line in JSON or Rust isn't offered as a fold.
+  - Bracket matching ignores brackets inside strings and comments, and requires matching bracket types.
+  - Gutter column displays fold chevrons: `⌄` for foldable blocks and `›` for collapsed blocks; a collapsed block shows a `...` pill at the line end.
+  - Gutter click partition distinguishes between breakpoint toggling (left 24px) and code folding (chevron column).
+  - Arrow keys, Page Up/Down, mouse wheel and scrollbar move by visible lines, and the caret is drawn on its visual row. The scrollbar's range and thumb count visible rows, so folded lines don't distort it.
+  - Folds move with edits above them; an edit inside a folded block, or a cursor landing in one (search, go to definition, undo), unfolds it. Folding the block the caret is in moves the caret to the fold's first line.
+  - Chevrons are drawn as vector strokes, so they render even when the editor font lacks the `⌄`/`›` glyphs.
+
+#### Changed
+- **Source Control Panel Redesign**: Reworked the native Git sidebar around a clearer commit composer, larger Commit and sync controls, a dedicated branch/ahead-behind status strip, count badges, collapsible Staged/Changes/History sections, a polished clean-worktree state, timeline-style history cards, and an internal history scrollbar. Rendering and hit-testing continue to share the same geometry, so all existing stage, unstage, discard, commit, Push, Pull, Fetch, keyboard navigation, and diff actions remain aligned with the new layout.
+
+#### Fixed
+- **Workspace Search Keyboard Navigation**: Submitting a project-wide search now transfers focus from the query field to the results list, where `Up`/`Down` change the selection and `Enter` opens it. Mouse and keyboard result activation both return input to the editor cleanly.
+- **Stale Sidebar and Search Focus**: Opening or closing a workspace now clears obsolete search/list focus. `Esc` also exits focused sidebar lists, closes Search when appropriate, and prevents an invisible focus state from trapping later input.
+- **Hidden Editor Mutations**: Navigation, Tab, Backspace, and Delete are consumed by the focused sidebar instead of changing the editor behind it. Editor control chords are likewise guarded while list focus is active.
+- **Global Shortcuts While Panels Are Focused**: `Ctrl+Shift+X` continues to open Extensions, debugger commands (`F5`, `Shift+F5`, `F10`, `F11`, `Shift+F11`) still reach their handlers, and `Ctrl+Shift+W` closes the workspace even when the terminal has focus.
+- **Output Pane Program Input**: `Enter` now sends the pipe-appropriate CRLF sequence to a running program, while Backspace uses modifier-aware terminal encoding (`DEL` normally and `BS` with Control).
+- **Shift+Alt+F, F10 and Alt Keys Never Reached LightLine**: Windows delivers Alt chords and F10 as `WM_SYSKEYDOWN`, which the window ignored, so Format Document (`Shift+Alt+F`), Step Over (`F10`) and Alt keys in the terminal did nothing. They are now routed to the key handler; `Alt+F4` and other system keys keep their default behavior.
+- **Minimize Scrolled the Editor**: Minimizing and restoring the window no longer leaves the editor scrolled to the caret line.
+- **Status Messages Were Never Shown**: The editor's status bar always displayed a fixed "Ready", so every message LightLine reported (format results and errors, "Committed", unavailable shells, ...) was invisible. The latest message now appears in the status bar for five seconds, in red when something failed.
+- **Enter in the Command Palette Also Typed a Newline**: When Enter ran a palette command, accepted a completion or confirmed an Explorer rename, the character Windows generates for the same key press still reached the editor and inserted a blank line (a Tab accepting a completion likewise inserted a tab). Those characters are now dropped.
+- **Editor Caret Rendering Consistency**: Normalized the caret visibility condition so it remains suppressed whenever terminal, search, sidebar, or another split pane owns focus.
+
 ### 2026-09-24
 
 #### Added

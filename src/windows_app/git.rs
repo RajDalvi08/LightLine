@@ -3,14 +3,16 @@ use super::*;
 // Source control sidebar geometry, in logical pixels below the panel header.
 // The commit message box and button stay pinned while the change list scrolls,
 // so their rectangles come from the same layout as the rows.
-const COMMIT_TOP: i32 = 42;
-const COMMIT_HEIGHT: i32 = 44;
-const COMMIT_BUTTON_HEIGHT: i32 = 26;
+const COMMIT_TOP: i32 = 50;
+const COMMIT_HEIGHT: i32 = 54;
+const COMMIT_BUTTON_HEIGHT: i32 = 34;
 // Push, pull and fetch sit in a row of their own below the commit button.
-const SYNC_HEIGHT: i32 = 24;
-pub(super) const ROW_HEADER: i32 = 26;
+const SYNC_HEIGHT: i32 = 34;
+const BRANCH_HEIGHT: i32 = 38;
+pub(super) const ROW_HEADER: i32 = 34;
 pub(super) const ROW_CHANGE: i32 = EXPLORER_ROW;
-pub(super) const ROW_COMMIT: i32 = 34;
+pub(super) const ROW_COMMIT: i32 = 48;
+pub(super) const ROW_CLEAN: i32 = 82;
 // Row action buttons are square and right aligned, like the rest of the panel.
 pub(super) const ROW_BUTTON: i32 = 22;
 
@@ -27,6 +29,7 @@ pub(super) enum GitRow {
         staged: bool,
     },
     Commit(CommitEntry),
+    Clean,
     Note(&'static str),
 }
 
@@ -43,6 +46,7 @@ impl GitRow {
             Self::Header { .. } => ROW_HEADER,
             Self::Change { .. } | Self::Note(_) => ROW_CHANGE,
             Self::Commit(_) => ROW_COMMIT,
+            Self::Clean => ROW_CLEAN,
         }
     }
 
@@ -62,6 +66,7 @@ pub(super) enum GitHit {
     Push,
     Pull,
     Fetch,
+    ToggleSection(GitSection),
     Row(usize),
     Toggle(usize),
     Discard(usize),
@@ -72,6 +77,7 @@ pub(super) struct GitLayout {
     pub commit_box: RECT,
     pub commit_button: RECT,
     pub sync: [RECT; 3],
+    pub branch: RECT,
     pub refresh: RECT,
     pub list_top: i32,
 }
@@ -99,7 +105,42 @@ impl App {
         });
     }
 
+    pub(super) fn unwatch_git_files(&mut self) {
+        if let Some(watcher) = &self.watcher {
+            for path in self.git_watch_files.drain(..) {
+                watcher.unwatch_file(path);
+            }
+        }
+    }
+
     pub(super) fn apply_repo_state(&mut self, hwnd: HWND, state: RepoState) {
+        // A commit, checkout or reset -- from LightLine or a terminal -- moves
+        // HEAD, and the gutter compares against HEAD's text, so drop the
+        // cached copy and read it again.
+        let head_moved = self.git_root.as_ref() != Some(&state.root)
+            || self.history.first().map(|c| &c.oid) != state.history.first().map(|c| &c.oid);
+        if head_moved {
+            self.git_head_cache.clear();
+            self.git_diff_cache.clear();
+            self.git_untracked.clear();
+            self.gutter_done = None;
+        }
+        let watch: Vec<PathBuf> = state
+            .git_dir
+            .iter()
+            .flat_map(|dir| [dir.join("index"), dir.join("HEAD")])
+            .collect();
+        if watch != self.git_watch_files
+            && let Some(watcher) = &self.watcher
+        {
+            for path in &self.git_watch_files {
+                watcher.unwatch_file(path.clone());
+            }
+            for path in &watch {
+                watcher.watch_file(path.clone());
+            }
+            self.git_watch_files = watch;
+        }
         self.git_root = Some(state.root.clone());
         self.workspace_branch = Some(state.head_label());
         self.git_ahead = state.ahead;
@@ -113,6 +154,9 @@ impl App {
         let rows = self.git_rows().len();
         self.panel_selected = self.panel_selected.min(rows.saturating_sub(1));
         self.git_scroll_into_view(hwnd);
+        if head_moved {
+            self.refresh_active_git_diff(hwnd);
+        }
         // The status line belongs to whatever the user last asked for, so the
         // counts here stay in the section headers instead of overwriting it.
         self.refresh(hwnd);
@@ -126,30 +170,41 @@ impl App {
             return rows;
         }
         let staged: Vec<&Change> = self.changes.iter().filter(|change| change.staged).collect();
-        let unstaged: Vec<&Change> = self.changes.iter().filter(|change| change.unstaged).collect();
-        if !staged.is_empty() {
+        let unstaged: Vec<&Change> = self
+            .changes
+            .iter()
+            .filter(|change| change.unstaged)
+            .collect();
+        let has_staged = !staged.is_empty();
+        if has_staged {
             rows.push(GitRow::Header {
                 title: "STAGED",
                 count: staged.len(),
                 section: GitSection::Staged,
             });
-            rows.extend(staged.into_iter().map(|change| GitRow::Change {
-                change: change.clone(),
-                staged: true,
-            }));
+            if !self.git_staged_collapsed {
+                rows.extend(staged.into_iter().map(|change| GitRow::Change {
+                    change: change.clone(),
+                    staged: true,
+                }));
+            }
         }
         rows.push(GitRow::Header {
             title: "CHANGES",
             count: unstaged.len(),
             section: GitSection::Changes,
         });
-        if unstaged.is_empty() {
-            rows.push(GitRow::Note("No changes in the working tree."));
-        } else {
-            rows.extend(unstaged.into_iter().map(|change| GitRow::Change {
-                change: change.clone(),
-                staged: false,
-            }));
+        if !self.git_changes_collapsed {
+            if !has_staged && unstaged.is_empty() {
+                rows.push(GitRow::Clean);
+            } else if unstaged.is_empty() {
+                rows.push(GitRow::Note("No unstaged changes."));
+            } else {
+                rows.extend(unstaged.into_iter().map(|change| GitRow::Change {
+                    change: change.clone(),
+                    staged: false,
+                }));
+            }
         }
         if !self.history.is_empty() {
             rows.push(GitRow::Header {
@@ -157,7 +212,9 @@ impl App {
                 count: self.history.len(),
                 section: GitSection::History,
             });
-            rows.extend(self.history.iter().cloned().map(GitRow::Commit));
+            if !self.git_history_collapsed {
+                rows.extend(self.history.iter().cloned().map(GitRow::Commit));
+            }
         }
         rows
     }
@@ -171,6 +228,8 @@ impl App {
         let button_bottom = button_top + self.scale(COMMIT_BUTTON_HEIGHT);
         let sync_top = button_bottom + self.scale(8);
         let sync_bottom = sync_top + self.scale(SYNC_HEIGHT);
+        let branch_top = sync_bottom + self.scale(10);
+        let branch_bottom = branch_top + self.scale(BRANCH_HEIGHT);
         let gap = self.scale(6);
         let third = ((box_right - box_left - gap * 2) / 3).max(1);
         GitLayout {
@@ -197,13 +256,19 @@ impl App {
                     bottom: sync_bottom,
                 }
             }),
+            branch: RECT {
+                left: box_left,
+                top: branch_top,
+                right: box_right,
+                bottom: branch_bottom,
+            },
             refresh: RECT {
                 left: right - self.scale(34),
                 top: self.scale(12),
                 right: right - self.scale(10),
                 bottom: self.scale(34),
             },
-            list_top: sync_bottom + self.scale(12),
+            list_top: branch_bottom + self.scale(8),
         }
     }
 
@@ -240,11 +305,7 @@ impl App {
         if contains(&layout.commit_button, x, y) {
             return GitHit::CommitButton;
         }
-        match layout
-            .sync
-            .iter()
-            .position(|rect| contains(rect, x, y))
-        {
+        match layout.sync.iter().position(|rect| contains(rect, x, y)) {
             Some(0) => return GitHit::Push,
             Some(1) => return GitHit::Pull,
             Some(2) => return GitHit::Fetch,
@@ -282,8 +343,13 @@ impl App {
                     }
                     return GitHit::Row(index);
                 }
-                GitRow::Header { section, .. } => match section {
-                    GitSection::Changes => {
+                GitRow::Header { section, .. } => {
+                    let action = match section {
+                        GitSection::Changes => Some(GitHit::StageAll),
+                        GitSection::Staged => Some(GitHit::UnstageAll),
+                        GitSection::History => None,
+                    };
+                    if let Some(action) = action {
                         let size = self.scale(ROW_BUTTON);
                         let edge = right - self.scale(8);
                         let rect = RECT {
@@ -293,30 +359,47 @@ impl App {
                             bottom: rect.bottom,
                         };
                         if contains(&rect, x, y) {
-                            return GitHit::StageAll;
+                            return action;
                         }
                     }
-                    GitSection::Staged => {
-                        let size = self.scale(ROW_BUTTON);
-                        let edge = right - self.scale(8);
-                        let rect = RECT {
-                            left: edge - size,
-                            top: rect.top,
-                            right: edge,
-                            bottom: rect.bottom,
-                        };
-                        if contains(&rect, x, y) {
-                            return GitHit::UnstageAll;
-                        }
-                    }
-                    GitSection::History => {}
-                },
+                    return GitHit::ToggleSection(*section);
+                }
                 GitRow::Commit(_) => return GitHit::Row(index),
-                GitRow::Note(_) => {}
+                GitRow::Clean | GitRow::Note(_) => {}
             }
             return GitHit::Nothing;
         }
         GitHit::Nothing
+    }
+
+    pub(super) fn git_section_collapsed(&self, section: GitSection) -> bool {
+        match section {
+            GitSection::Staged => self.git_staged_collapsed,
+            GitSection::Changes => self.git_changes_collapsed,
+            GitSection::History => self.git_history_collapsed,
+        }
+    }
+
+    pub(super) fn git_toggle_section(&mut self, hwnd: HWND, section: GitSection) {
+        let collapsed = match section {
+            GitSection::Staged => &mut self.git_staged_collapsed,
+            GitSection::Changes => &mut self.git_changes_collapsed,
+            GitSection::History => &mut self.git_history_collapsed,
+        };
+        *collapsed = !*collapsed;
+
+        let rows = self.git_rows();
+        self.panel_first = self.panel_first.min(rows.len().saturating_sub(1));
+        self.panel_selected = self.panel_selected.min(rows.len().saturating_sub(1));
+        if !rows
+            .get(self.panel_selected)
+            .is_some_and(GitRow::selectable)
+            && let Some(index) = rows.iter().position(GitRow::selectable)
+        {
+            self.panel_selected = index;
+        }
+        self.git_scroll_into_view(hwnd);
+        unsafe { InvalidateRect(hwnd, null(), 0) };
     }
 
     /// Move the selection to the next row Up/Down can act on.
@@ -407,7 +490,9 @@ impl App {
         self.open(hwnd, Some(path));
         let line = {
             let doc = self.doc();
-            number.saturating_sub(1).min(doc.line_count().saturating_sub(1))
+            number
+                .saturating_sub(1)
+                .min(doc.line_count().saturating_sub(1))
         };
         self.move_cursor(Pos { line, byte: 0 }, false);
         self.keep_cursor_visible(hwnd);

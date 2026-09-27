@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::terminal::ShellKind;
+
 /// User-configurable settings loaded from `%APPDATA%\LightLine\settings.json`.
 /// All fields have sensible defaults matching the current hardcoded values so
 /// an absent or partial file still produces a usable editor.
@@ -19,6 +21,7 @@ pub struct Settings {
     pub minimap: bool,
     pub smooth_scrolling: bool,
     pub parse_limit_kb: usize,
+    pub default_terminal_profile: ShellKind,
     // Colors can be overridden; values are 0xRRGGBB.
     pub colors: HashMap<String, u32>,
 }
@@ -39,6 +42,7 @@ impl Default for Settings {
             minimap: true,
             smooth_scrolling: false,
             parse_limit_kb: 128,
+            default_terminal_profile: ShellKind::PowerShell,
             colors: HashMap::new(),
         }
     }
@@ -56,13 +60,21 @@ impl Settings {
     /// Load settings from the user's settings file, falling back to defaults
     /// for any missing or unparseable fields.
     pub fn load() -> Self {
+        Self::try_load().unwrap_or_default()
+    }
+
+    /// Like `load`, but reports a settings file that exists and can't be
+    /// used instead of silently falling back to defaults. A missing file is
+    /// not an error: it just means nothing has been customized yet.
+    pub fn try_load() -> Result<Self, String> {
         let Some(path) = Self::settings_path() else {
-            return Self::default();
+            return Ok(Self::default());
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        Self::from_json(&text)
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("Could not read settings.json: {e}")),
+        }
     }
 
     /// Save current settings to the settings file, creating the directory
@@ -75,10 +87,9 @@ impl Settings {
         std::fs::write(&path, json).map_err(|e| format!("Could not write settings: {e}"))
     }
 
-    fn from_json(text: &str) -> Self {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Self::default();
-        };
+    fn parse(text: &str) -> Result<Self, String> {
+        let value = serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|e| format!("settings.json is invalid JSON ({e}); settings not applied"))?;
         let mut settings = Self::default();
         if let Some(s) = value.get("fontFamily").and_then(|v| v.as_str()) {
             settings.font_family = Some(s.to_owned());
@@ -119,6 +130,19 @@ impl Settings {
         if let Some(n) = value.get("parseLimitKb").and_then(|v| v.as_u64()) {
             settings.parse_limit_kb = (n as usize).clamp(32, 4096);
         }
+        if let Some(s) = value
+            .get("terminalDefaultProfile")
+            .or_else(|| value.get("terminalShell"))
+            .and_then(|v| v.as_str())
+        {
+            let lower = s.trim().to_ascii_lowercase();
+            settings.default_terminal_profile = match lower.as_str() {
+                "cmd" | "command prompt" | "commandprompt" => ShellKind::CommandPrompt,
+                "bash" | "gitbash" | "git bash" => ShellKind::GitBash,
+                "wsl" => ShellKind::Wsl,
+                _ => ShellKind::PowerShell,
+            };
+        }
         if let Some(obj) = value.get("colors").and_then(|v| v.as_object()) {
             for (key, val) in obj {
                 if let Some(hex) = val.as_str()
@@ -128,7 +152,7 @@ impl Settings {
                 }
             }
         }
-        settings
+        Ok(settings)
     }
 
     fn to_json(&self) -> String {
@@ -151,10 +175,7 @@ impl Settings {
             "insertSpaces".into(),
             serde_json::Value::Bool(self.insert_spaces),
         );
-        obj.insert(
-            "wordWrap".into(),
-            serde_json::Value::Bool(self.word_wrap),
-        );
+        obj.insert("wordWrap".into(), serde_json::Value::Bool(self.word_wrap));
         obj.insert(
             "autoClosePairs".into(),
             serde_json::Value::Bool(self.auto_close_pairs),
@@ -175,10 +196,7 @@ impl Settings {
             "indentGuides".into(),
             serde_json::Value::Bool(self.indent_guides),
         );
-        obj.insert(
-            "minimap".into(),
-            serde_json::Value::Bool(self.minimap),
-        );
+        obj.insert("minimap".into(), serde_json::Value::Bool(self.minimap));
         obj.insert(
             "smoothScrolling".into(),
             serde_json::Value::Bool(self.smooth_scrolling),
@@ -186,6 +204,10 @@ impl Settings {
         obj.insert(
             "parseLimitKb".into(),
             serde_json::Value::Number(self.parse_limit_kb.into()),
+        );
+        obj.insert(
+            "terminalDefaultProfile".into(),
+            serde_json::Value::String(self.default_terminal_profile.name().to_string()),
         );
         serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap_or_default()
     }
@@ -217,6 +239,7 @@ mod tests {
         assert!(s.auto_indent);
         assert!(s.bracket_matching);
         assert!(!s.format_on_save);
+        assert_eq!(s.default_terminal_profile, ShellKind::PowerShell);
     }
 
     #[test]
@@ -225,8 +248,18 @@ mod tests {
             format_on_save: true,
             ..Settings::default()
         };
-        let loaded = Settings::from_json(&s.to_json());
+        let loaded = Settings::parse(&s.to_json()).unwrap();
         assert!(loaded.format_on_save);
+    }
+
+    #[test]
+    fn terminal_profile_round_trips() {
+        let s = Settings {
+            default_terminal_profile: ShellKind::GitBash,
+            ..Settings::default()
+        };
+        let loaded = Settings::parse(&s.to_json()).unwrap();
+        assert_eq!(loaded.default_terminal_profile, ShellKind::GitBash);
     }
 
     #[test]
@@ -238,7 +271,7 @@ mod tests {
             "autoClosePairs": false,
             "colors": { "editorBg": "#0c1523" }
         }"##;
-        let s = Settings::from_json(json);
+        let s = Settings::parse(json).unwrap();
         assert_eq!(s.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(s.font_size, 18);
         assert_eq!(s.tab_size, 2);
@@ -248,10 +281,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_returns_defaults() {
-        let s = Settings::from_json("not json {{{");
-        assert_eq!(s.font_size, 15);
-        assert!(s.auto_close_pairs);
+    fn malformed_json_is_reported() {
+        let error = Settings::parse("not json {{{").err().unwrap();
+        assert!(error.contains("invalid"));
+        // A trailing comma is the usual hand-editing mistake.
+        assert!(Settings::parse("{\"formatOnSave\": true,}").is_err());
     }
 
     #[test]
@@ -271,7 +305,7 @@ mod tests {
         };
         s.font_size = 20;
         let json = s.to_json();
-        let loaded = Settings::from_json(&json);
+        let loaded = Settings::parse(&json).unwrap();
         assert_eq!(loaded.font_family.as_deref(), Some("Fira Code"));
         assert_eq!(loaded.font_size, 20);
     }

@@ -56,7 +56,11 @@ impl App {
             "OUTPUT",
             layout.output.left,
             top + self.scale(9),
-            if output_active { self.theme.text } else { self.theme.muted },
+            if output_active {
+                self.theme.text
+            } else {
+                self.theme.muted
+            },
             layout.output,
         );
         if output_active {
@@ -74,23 +78,28 @@ impl App {
 
         // One tab per interactive shell session, marked with a leading bullet.
         for (index, rect) in layout.terminals.iter().enumerate() {
-            let title = self
-                .terminals
-                .get(index)
-                .map(|pane| pane.title.as_str())
-                .unwrap_or("?");
+            let pane = self.terminals.get(index);
+            let shell_tag = pane
+                .map(|p| p.shell_kind.tag().to_uppercase())
+                .unwrap_or_else(|| "TERMINAL".into());
+            let title = pane.map(|p| p.title.as_str()).unwrap_or("?");
             let label = if self.terminals.len() == 1 {
-                "TERMINAL".to_string()
+                shell_tag
             } else {
-                format!("TERMINAL {title}")
+                format!("{shell_tag} {title}")
             };
-            let active = self.terminal_tab == TerminalTab::Terminal && index == self.terminal_active;
+            let active =
+                self.terminal_tab == TerminalTab::Terminal && index == self.terminal_active;
             Self::label(
                 hdc,
                 &label,
                 rect.left + self.scale(6),
                 top + self.scale(9),
-                if active { self.theme.text } else { self.theme.muted },
+                if active {
+                    self.theme.text
+                } else {
+                    self.theme.muted
+                },
                 *rect,
             );
             if active {
@@ -112,17 +121,29 @@ impl App {
         Self::label(
             hdc,
             "+",
-            layout.plus.left + self.scale(8),
+            layout.plus.left + self.scale(6),
             top + self.scale(8),
             self.theme.muted,
             layout.plus,
         );
         Self::label(
             hdc,
+            "\u{25be}",
+            layout.chevron.left + self.scale(3),
+            top + self.scale(8),
+            self.theme.muted,
+            layout.chevron,
+        );
+        Self::label(
+            hdc,
             "\u{2715}",
             layout.kill.left + self.scale(4),
             top + self.scale(9),
-            if shell_open { self.theme.muted } else { rgb(74, 80, 94) },
+            if shell_open {
+                self.theme.muted
+            } else {
+                rgb(74, 80, 94)
+            },
             layout.kill,
         );
 

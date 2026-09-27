@@ -68,8 +68,7 @@ impl App {
     /// linked worktrees, submodules and detached HEAD, so ask Git instead.
     pub(super) fn head_branch(root: &Path) -> Option<String> {
         let root = workflow::repo_root(root)?;
-        if let Ok(branch) =
-            workflow::git_output(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
+        if let Ok(branch) = workflow::git_output(&root, &["symbolic-ref", "--short", "-q", "HEAD"])
         {
             let branch = branch.trim();
             if !branch.is_empty() {
@@ -115,6 +114,9 @@ impl App {
         self.commit_message.clear();
         self.commit_focus = false;
         self.git_diff_cache.clear();
+        self.git_head_cache.clear();
+        self.git_untracked.clear();
+        self.unwatch_git_files();
         self.gutter_done = None;
         self.review_file = None;
         self.reset_terminal_sessions(hwnd);
@@ -183,6 +185,9 @@ impl App {
         self.git_busy = false;
         self.commit_message.clear();
         self.git_diff_cache.clear();
+        self.git_head_cache.clear();
+        self.git_untracked.clear();
+        self.unwatch_git_files();
         self.gutter_done = None;
         self.review_file = None;
         self.reset_terminal_sessions(hwnd);
@@ -294,7 +299,11 @@ impl App {
         };
         let res = dialog::show_dialog(
             hwnd,
-            if is_dir { "Delete Folder" } else { "Delete File" },
+            if is_dir {
+                "Delete Folder"
+            } else {
+                "Delete File"
+            },
             &prompt,
             dialog::DialogIcon::Question,
             &[dialog::BTN_DELETE, dialog::BTN_CANCEL],
@@ -306,9 +315,9 @@ impl App {
         let mut i = 0;
         while i < self.tabs.len() {
             let tab_path = self.tabs[i].document.path.clone();
-            let should_close = tab_path.as_deref().is_some_and(|tp| {
-                tp == path || (is_dir && tp.starts_with(path))
-            });
+            let should_close = tab_path
+                .as_deref()
+                .is_some_and(|tp| tp == path || (is_dir && tp.starts_with(path)));
             if should_close {
                 self.tabs[i].document.mark_clean();
                 self.close_tab(hwnd, i);
@@ -348,7 +357,8 @@ impl App {
 
     pub(super) fn rename_entry(&mut self, hwnd: HWND, old_path: &Path, new_name: &str) {
         let new_name = new_name.trim();
-        if new_name.is_empty() || new_name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+        if new_name.is_empty() || new_name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+        {
             self.status = "Invalid name".into();
             unsafe { InvalidateRect(hwnd, null(), 0) };
             return;

@@ -1,5 +1,6 @@
-use std::fs;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -35,7 +36,11 @@ fn recent_path() -> Option<PathBuf> {
 /// extension a user has placed there. No installer/registry writes here yet —
 /// this is only ever read from.
 pub fn extensions_dir() -> Option<PathBuf> {
-    Some(PathBuf::from(std::env::var_os("APPDATA")?).join("LightLine").join("extensions"))
+    Some(
+        PathBuf::from(std::env::var_os("APPDATA")?)
+            .join("LightLine")
+            .join("extensions"),
+    )
 }
 
 pub fn recent_workspaces() -> Vec<PathBuf> {
@@ -112,10 +117,7 @@ fn session_view_from(value: &Value) -> SessionView {
         })
     };
     SessionView {
-        cursor: value
-            .get("cursor")
-            .and_then(pair)
-            .unwrap_or((0, 0)),
+        cursor: value.get("cursor").and_then(pair).unwrap_or((0, 0)),
         anchor: value.get("anchor").and_then(pair),
         first_line: value.get("first").and_then(Value::as_u64).unwrap_or(0) as usize,
     }
@@ -149,7 +151,10 @@ pub fn load_session() -> Session {
             items
                 .iter()
                 .filter_map(|item| {
-                    let path = item.get("path").and_then(Value::as_str).map(PathBuf::from)?;
+                    let path = item
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)?;
                     if !path.is_file() {
                         return None;
                     }
@@ -161,8 +166,14 @@ pub fn load_session() -> Session {
                     };
                     let views = match views {
                         Some(views) => [
-                            views.first().map(session_view_from).unwrap_or_else(|| default.clone()),
-                            views.get(1).map(session_view_from).unwrap_or_else(|| default.clone()),
+                            views
+                                .first()
+                                .map(session_view_from)
+                                .unwrap_or_else(|| default.clone()),
+                            views
+                                .get(1)
+                                .map(session_view_from)
+                                .unwrap_or_else(|| default.clone()),
                         ],
                         None => [default.clone(), default],
                     };
@@ -172,11 +183,7 @@ pub fn load_session() -> Session {
                 .collect()
         })
         .unwrap_or_default();
-    Session {
-        root,
-        active,
-        tabs,
-    }
+    Session { root, active, tabs }
 }
 
 pub fn save_session(session: &Session) {
@@ -279,6 +286,8 @@ pub struct RepoState {
     pub conflicted: bool,
     /// Recent commits, newest first.
     pub history: Vec<CommitEntry>,
+    /// The absolute Git directory (`.git`, or a worktree's own directory).
+    pub git_dir: Option<PathBuf>,
 }
 
 impl RepoState {
@@ -304,6 +313,13 @@ impl RepoState {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GutterDiff {
+    pub added: HashSet<usize>,
+    pub modified: HashSet<usize>,
+    pub deleted: HashSet<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DiffRow {
     pub changed: bool,
@@ -311,6 +327,7 @@ pub struct DiffRow {
     pub before: String,
     pub after_number: Option<usize>,
     pub after: String,
+    pub deleted_at: Option<usize>,
 }
 
 pub fn workspace_files(root: &Path) -> Vec<PathBuf> {
@@ -517,7 +534,10 @@ pub fn run_python_file_stream(
     }
 }
 
-fn stream_reader(mut reader: impl Read + Send + 'static, output: Sender<String>) -> std::thread::JoinHandle<()> {
+fn stream_reader(
+    mut reader: impl Read + Send + 'static,
+    output: Sender<String>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buffer = [0; 1024];
         loop {
@@ -630,7 +650,11 @@ pub fn command_available(name: &str) -> bool {
 // -o and only works from inside a Developer Command Prompt environment, so
 // detecting it on PATH doesn't mean the -o command line below would work.
 pub fn detect_c_compiler(is_cpp: bool) -> Option<&'static str> {
-    let ordered = if is_cpp { ["g++", "clang++"] } else { ["gcc", "clang"] };
+    let ordered = if is_cpp {
+        ["g++", "clang++"]
+    } else {
+        ["gcc", "clang"]
+    };
     ordered.into_iter().find(|name| command_available(name))
 }
 
@@ -638,7 +662,11 @@ pub fn detect_c_compiler(is_cpp: bool) -> Option<&'static str> {
 /// binary produced) and turns gcc/clang's diagnostics into the same
 /// `Diagnostic` type LSP servers report, so the existing squiggly-underline
 /// rendering can show C/C++ errors too without a persistent language server.
-pub fn c_syntax_diagnostics(file: &Path, compiler: &str, is_cpp: bool) -> Vec<crate::lsp::Diagnostic> {
+pub fn c_syntax_diagnostics(
+    file: &Path,
+    compiler: &str,
+    is_cpp: bool,
+) -> Vec<crate::lsp::Diagnostic> {
     let mut command = background_command(compiler);
     command.arg("-fsyntax-only").arg("-Wall");
     if is_cpp {
@@ -679,8 +707,14 @@ fn parse_gcc_diagnostic(line: &str) -> Option<crate::lsp::Diagnostic> {
     let line_index = line_number - 1;
     Some(Diagnostic {
         range: Range {
-            start: Position { line: line_index, character },
-            end: Position { line: line_index, character: character + 1 },
+            start: Position {
+                line: line_index,
+                character,
+            },
+            end: Position {
+                line: line_index,
+                character: character + 1,
+            },
         },
         severity,
         message: message.trim().to_string(),
@@ -698,9 +732,13 @@ pub fn git_output(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// GIT_OPTIONAL_LOCKS=0 stops read-only commands such as `git status` from
+// rewriting .git/index to refresh its stat cache. LightLine watches that file
+// to notice commits made in a terminal, so its own reads must not touch it.
 fn git_command(root: &Path, args: &[&str]) -> Command {
     let mut command = background_command("git");
     command
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(root)
         .args(["--no-pager", "-c", "core.quotePath=false"])
@@ -762,6 +800,9 @@ pub fn repo_state(root: &Path) -> Result<RepoState, String> {
     let mut state = parse_porcelain_v2(&text);
     state.root = repo_root(root).unwrap_or_else(|| root.to_path_buf());
     state.history = log(root, 30).unwrap_or_default();
+    state.git_dir = git_output(root, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .and_then(|text| text.lines().next().map(PathBuf::from));
     Ok(state)
 }
 
@@ -786,7 +827,10 @@ pub fn parse_porcelain_v2(text: &str) -> RepoState {
         }
     }
 
-    let records: Vec<&str> = text.split('\0').filter(|record| !record.is_empty()).collect();
+    let records: Vec<&str> = text
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect();
     let mut state = RepoState::default();
     let mut oid = String::new();
     let mut index = 0;
@@ -944,8 +988,12 @@ pub fn parse_log(text: &str) -> Vec<CommitEntry> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.split('\u{1f}');
-            let (oid, author, date, subject) =
-                (fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+            let (oid, author, date, subject) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
             (!oid.is_empty()).then(|| CommitEntry {
                 oid: oid.to_owned(),
                 author: author.to_owned(),
@@ -984,17 +1032,20 @@ pub fn git_diff(root: &Path, path: &Path, scope: DiffScope) -> Result<Vec<DiffRo
                 before: String::new(),
                 after_number: Some(index + 1),
                 after: line.to_owned(),
+                deleted_at: None,
             })
             .collect());
     }
     let mut output = match scope {
-        DiffScope::Head => git_command(root, &["diff", "--no-ext-diff", "--unified=2", "HEAD", "--"]),
-        DiffScope::Staged => {
-            git_command(root, &["diff", "--no-ext-diff", "--cached", "--unified=2", "--"])
-        }
-        DiffScope::Unstaged => {
-            git_command(root, &["diff", "--no-ext-diff", "--unified=2", "--"])
-        }
+        DiffScope::Head => git_command(
+            root,
+            &["diff", "--no-ext-diff", "--unified=2", "HEAD", "--"],
+        ),
+        DiffScope::Staged => git_command(
+            root,
+            &["diff", "--no-ext-diff", "--cached", "--unified=2", "--"],
+        ),
+        DiffScope::Unstaged => git_command(root, &["diff", "--no-ext-diff", "--unified=2", "--"]),
     };
     let output = output
         .arg(path)
@@ -1017,12 +1068,14 @@ fn parse_diff(text: &str) -> Vec<DiffRow> {
                  new_number: &mut usize| {
         let count = removed.len().max(added.len());
         for index in 0..count {
+            let is_del = removed.get(index).is_some() && added.is_empty();
             rows.push(DiffRow {
                 changed: true,
                 before_number: removed.get(index).map(|_| *old_number + index),
                 before: removed.get(index).cloned().unwrap_or_default(),
                 after_number: added.get(index).map(|_| *new_number + index),
                 after: added.get(index).cloned().unwrap_or_default(),
+                deleted_at: if is_del { Some(*new_number) } else { None },
             });
         }
         *old_number += removed.len();
@@ -1072,6 +1125,7 @@ fn parse_diff(text: &str) -> Vec<DiffRow> {
                 before: value.to_owned(),
                 after_number: Some(new_number),
                 after: value.to_owned(),
+                deleted_at: None,
             });
             old_number += 1;
             new_number += 1;
@@ -1089,6 +1143,191 @@ fn parse_diff(text: &str) -> Vec<DiffRow> {
     );
     rows.truncate(2_000);
     rows
+}
+
+/// Reads the HEAD content of `path` from git in `root`.
+pub fn git_head_text(root: &Path, path: &Path) -> Result<String, String> {
+    let spec = format!("HEAD:{}", path.to_string_lossy().replace('\\', "/"));
+    let output = git_command(root, &["show", &spec])
+        .output()
+        .map_err(|error| format!("Could not start Git: {error}"))?;
+    if !output.status.success() {
+        return Err("File not found in HEAD".into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Upper bound on Myers diff work per call (edit distance x trimmed lines),
+/// so a live recompute after a keystroke stays within a few milliseconds
+/// even on a large file. Past it, the changed region is marked as a whole.
+const GUTTER_DIFF_BUDGET: usize = 2_000_000;
+
+#[derive(Clone, Copy, PartialEq)]
+enum LineOp {
+    Equal,
+    Delete,
+    Insert,
+}
+
+// Myers' O((N+M)D) shortest edit script. Returns None when the edit
+// distance exceeds `max_d`.
+fn myers_line_ops(a: &[&str], b: &[&str], max_d: usize) -> Option<Vec<LineOp>> {
+    let n = a.len() as isize;
+    let m = b.len() as isize;
+    let max = (n + m) as usize;
+    let offset = max as isize + 1;
+    let mut v = vec![0isize; 2 * max + 3];
+    // trace[d] holds V for diagonals -d..=d after step d.
+    let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut end_d = None;
+    'search: for d in 0..=max.min(max_d) as isize {
+        let mut k = -d;
+        while k <= d {
+            let index = (offset + k) as usize;
+            let mut x = if k == -d || (k != d && v[index - 1] < v[index + 1]) {
+                v[index + 1]
+            } else {
+                v[index - 1] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && a[x as usize] == b[y as usize] {
+                x += 1;
+                y += 1;
+            }
+            v[index] = x;
+            if x >= n && y >= m {
+                trace.push(v[(offset - d) as usize..=(offset + d) as usize].to_vec());
+                end_d = Some(d);
+                break 'search;
+            }
+            k += 2;
+        }
+        trace.push(v[(offset - d) as usize..=(offset + d) as usize].to_vec());
+    }
+    let end_d = end_d?;
+
+    let mut ops = Vec::with_capacity((n + m) as usize);
+    let (mut x, mut y) = (n, m);
+    for d in (1..=end_d).rev() {
+        let previous = &trace[(d - 1) as usize];
+        let at = |k: isize| previous[(k + d - 1) as usize];
+        let k = x - y;
+        let prev_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) {
+            k + 1
+        } else {
+            k - 1
+        };
+        let prev_x = at(prev_k);
+        let prev_y = prev_x - prev_k;
+        while x > prev_x && y > prev_y {
+            ops.push(LineOp::Equal);
+            x -= 1;
+            y -= 1;
+        }
+        ops.push(if x == prev_x {
+            LineOp::Insert
+        } else {
+            LineOp::Delete
+        });
+        x = prev_x;
+        y = prev_y;
+    }
+    while x > 0 && y > 0 {
+        ops.push(LineOp::Equal);
+        x -= 1;
+        y -= 1;
+    }
+    ops.reverse();
+    Some(ops)
+}
+
+// Marks one changed region: `inserted` buffer lines starting at buffer line
+// `at`, replacing `removed` HEAD lines. Pure insertions are added, pure
+// removals leave a deletion marker on the following line, and anything
+// mixed is modified.
+fn mark_gutter_hunk(
+    diff: &mut GutterDiff,
+    at: usize,
+    removed: usize,
+    inserted: usize,
+    buffer_len: usize,
+) {
+    if inserted == 0 {
+        if removed > 0 && buffer_len > 0 {
+            diff.deleted.insert(at.min(buffer_len - 1));
+        }
+        return;
+    }
+    let target = if removed == 0 {
+        &mut diff.added
+    } else {
+        &mut diff.modified
+    };
+    target.extend(at..at + inserted);
+}
+
+/// Compares the buffer against its HEAD text for the editor gutter: lines
+/// added, lines modified, and lines that follow a deletion. Each changed
+/// region is classified on its own, so unchanged lines between two edits are
+/// never marked.
+pub fn compute_gutter_diff(head_text: &str, buf_lines: &[String]) -> GutterDiff {
+    // Split exactly the way Document does ("a\n" is two lines, "a" and ""),
+    // so a file's final newline never reads as an added line.
+    let head_lines: Vec<&str> = head_text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let buf: Vec<&str> = buf_lines.iter().map(String::as_str).collect();
+    let (n, m) = (head_lines.len(), buf.len());
+    let mut diff = GutterDiff::default();
+
+    let mut prefix = 0;
+    while prefix < n && prefix < m && head_lines[prefix] == buf[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < n - prefix
+        && suffix < m - prefix
+        && head_lines[n - 1 - suffix] == buf[m - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let old = &head_lines[prefix..n - suffix];
+    let new = &buf[prefix..m - suffix];
+    if old.is_empty() && new.is_empty() {
+        return diff;
+    }
+
+    let max_d = (GUTTER_DIFF_BUDGET / (old.len() + new.len()).max(1)).max(8);
+    let Some(ops) = myers_line_ops(old, new, max_d) else {
+        mark_gutter_hunk(&mut diff, prefix, old.len(), new.len(), m);
+        return diff;
+    };
+
+    let mut line = prefix;
+    let (mut removed, mut inserted, mut hunk_start) = (0, 0, prefix);
+    for op in ops {
+        match op {
+            LineOp::Equal => {
+                if removed + inserted > 0 {
+                    mark_gutter_hunk(&mut diff, hunk_start, removed, inserted, m);
+                    removed = 0;
+                    inserted = 0;
+                }
+                line += 1;
+                hunk_start = line;
+            }
+            LineOp::Delete => removed += 1,
+            LineOp::Insert => {
+                inserted += 1;
+                line += 1;
+            }
+        }
+    }
+    if removed + inserted > 0 {
+        mark_gutter_hunk(&mut diff, hunk_start, removed, inserted, m);
+    }
+    diff
 }
 
 #[cfg(test)]
@@ -1198,10 +1437,7 @@ mod tests {
         let file = root.join("loose_script.py");
         fs::write(&file, "print('hi')\n").unwrap();
         let workspace = temp_dir("python-workspace");
-        assert_eq!(
-            python_project_root(&file, Some(&workspace)),
-            workspace
-        );
+        assert_eq!(python_project_root(&file, Some(&workspace)), workspace);
         assert_eq!(python_project_root(&file, None), root);
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&workspace).unwrap();
@@ -1294,11 +1530,7 @@ mod tests {
         };
         let root = temp_dir("python-run-input");
         let file = root.join("script.py");
-        fs::write(
-            &file,
-            "name = input('name? ')\nprint('hello ' + name)\n",
-        )
-        .unwrap();
+        fs::write(&file, "name = input('name? ')\nprint('hello ' + name)\n").unwrap();
         let (output_tx, output_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
         input_tx.send("LightLine\n".to_string()).unwrap();
@@ -1558,12 +1790,88 @@ mod tests {
 
     #[test]
     fn parses_commit_log_records() {
-        let rows = parse_log("aaaa\u{1f}Ada\u{1f}Sep 12\u{1f}Add terminal\n\
-                              bbbb\u{1f}Ada\u{1f}Sep 13\u{1f}Fix: a bug, then another");
+        let rows = parse_log(
+            "aaaa\u{1f}Ada\u{1f}Sep 12\u{1f}Add terminal\n\
+                              bbbb\u{1f}Ada\u{1f}Sep 13\u{1f}Fix: a bug, then another",
+        );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].oid, "aaaa");
         assert_eq!(rows[0].author, "Ada");
         assert_eq!(rows[1].subject, "Fix: a bug, then another");
         assert!(parse_log("").is_empty());
+    }
+
+    fn buffer(text: &str) -> Vec<String> {
+        text.split('\n').map(str::to_owned).collect()
+    }
+
+    fn sorted(set: &HashSet<usize>) -> Vec<usize> {
+        let mut lines: Vec<usize> = set.iter().copied().collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    #[test]
+    fn test_compute_gutter_diff_added_modified_deleted() {
+        let head = "line1\nline2\nline3\nline4\nline5\n";
+
+        // Identical, including the final newline: no marks at all.
+        assert_eq!(
+            compute_gutter_diff(head, &buffer(head)),
+            GutterDiff::default()
+        );
+
+        let added = compute_gutter_diff(
+            head,
+            &buffer("line1\nline2\nnew line\nline3\nline4\nline5\n"),
+        );
+        assert_eq!(sorted(&added.added), vec![2]);
+        assert!(added.modified.is_empty() && added.deleted.is_empty());
+
+        let modified = compute_gutter_diff(
+            head,
+            &buffer("line1\nline2 modified\nline3\nline4\nline5\n"),
+        );
+        assert_eq!(sorted(&modified.modified), vec![1]);
+        assert!(modified.added.is_empty() && modified.deleted.is_empty());
+
+        let deleted = compute_gutter_diff(head, &buffer("line1\nline3\nline4\nline5\n"));
+        assert_eq!(sorted(&deleted.deleted), vec![1]);
+        assert!(deleted.added.is_empty() && deleted.modified.is_empty());
+    }
+
+    #[test]
+    fn gutter_diff_leaves_unchanged_lines_between_edits_unmarked() {
+        let head = "a\nb\nc\nd\ne\n";
+        // Two separate one-line edits with equal line counts.
+        let diff = compute_gutter_diff(head, &buffer("A\nb\nc\nd\nE\n"));
+        assert_eq!(sorted(&diff.modified), vec![0, 4]);
+        assert!(diff.added.is_empty() && diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn gutter_diff_classifies_each_hunk_separately() {
+        let head = "a\nb\nc\nd\ne\nf\n";
+        // Delete "b" near the top, insert a new line near the bottom.
+        let diff = compute_gutter_diff(head, &buffer("a\nc\nd\ne\nnew\nf\n"));
+        assert_eq!(sorted(&diff.deleted), vec![1]);
+        assert_eq!(sorted(&diff.added), vec![4]);
+        assert!(diff.modified.is_empty());
+    }
+
+    #[test]
+    fn gutter_diff_handles_empty_sides_and_large_rewrites() {
+        assert_eq!(
+            sorted(&compute_gutter_diff("a\n", &buffer("a\nx\ny\n")).added),
+            vec![1, 2]
+        );
+        assert_eq!(
+            sorted(&compute_gutter_diff("x\ny\n", &buffer("")).deleted),
+            vec![0]
+        );
+        let head: String = (0..5000).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..5000).map(|i| format!("new {i}\n")).collect();
+        let diff = compute_gutter_diff(&head, &buffer(&new));
+        assert_eq!(diff.modified.len(), 5000);
     }
 }
