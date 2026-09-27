@@ -1726,7 +1726,7 @@ impl App {
                 self.show_quick_open(hwnd);
                 return;
             }
-            if Tab::is_runnable(self.doc())
+            if self.run_button_visible(hwnd)
                 && x >= card_right - self.scale(82)
                 && x < card_right - self.scale(50)
             {

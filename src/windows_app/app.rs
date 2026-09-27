@@ -1601,6 +1601,18 @@ impl App {
             as usize
     }
 
+    /// Whether the tab strip has room for the Run button after the tabs.
+    /// The painter and the click handler both ask this, so a button that
+    /// isn't drawn (e.g. while the Assistant narrows the editor) can't take
+    /// clicks meant for a tab.
+    pub(super) fn run_button_visible(&self, hwnd: HWND) -> bool {
+        Tab::is_runnable(self.doc())
+            && self.editor_left()
+                + self.scale(TAB_WIDTH) * self.tabs.len().saturating_sub(self.tab_first) as i32
+                + self.scale(12)
+                < self.editor_right(hwnd) - self.scale(92)
+    }
+
     pub(super) fn keep_active_tab_visible(&mut self, hwnd: HWND) {
         let count = self.visible_tab_count(hwnd);
         if self.active < self.tab_first {
