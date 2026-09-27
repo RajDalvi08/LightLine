@@ -1874,6 +1874,7 @@ impl App {
 
             const CMD_NEW_FILE: usize = 1;
             const CMD_NEW_FOLDER: usize = 2;
+            const CMD_ADD_FILE: usize = 9;
             const CMD_REVEAL: usize = 3;
             const CMD_COPY_PATH: usize = 4;
             const CMD_COPY_REL_PATH: usize = 5;
@@ -1888,6 +1889,7 @@ impl App {
                 CMD_NEW_FOLDER,
                 wide("New Folder...").as_ptr(),
             );
+            AppendMenuW(menu, MF_STRING, CMD_ADD_FILE, wide("Add File...").as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
             AppendMenuW(
                 menu,
@@ -1944,6 +1946,9 @@ impl App {
                 }
                 CMD_NEW_FOLDER => {
                     self.start_explorer_input(parent_dir, true, false, None, hwnd);
+                }
+                CMD_ADD_FILE => {
+                    self.add_file_to_project(hwnd, &parent_dir);
                 }
                 CMD_REVEAL => {
                     let path_str = clicked_path.to_string_lossy().to_string();
